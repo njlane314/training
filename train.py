@@ -4,9 +4,9 @@ Train MinkUNetClassifier from a ROOT TTree with balanced (50/50) signal/backgrou
 
 Input ROOT branches expected (defaults; override via CLI):
   - is_signal     (bool / int)         : event label (1=signal, 0=background)
-  - detector_u    (vector<float>)      : flattened U plane image, length = H*W
-  - detector_v    (vector<float>)      : flattened V plane image, length = H*W
-  - detector_w    (vector<float>)      : flattened W plane image, length = H*W
+  - detector_image_u    (vector<float>)      : flattened U plane image, length = H*W
+  - detector_image_v    (vector<float>)      : flattened V plane image, length = H*W
+  - detector_image_w    (vector<float>)      : flattened W plane image, length = H*W
   - w_nominal     (double / float)     : event weight (used for *within-class* weighted sampling)
 
 Key behavior:
@@ -171,9 +171,9 @@ def build_model():
 @dataclass
 class BranchNames:
     is_signal: str = "is_signal"
-    u: str = "detector_u"
-    v: str = "detector_v"
-    w: str = "detector_w"
+    u: str = "detector_image_u"
+    v: str = "detector_image_v"
+    w: str = "detector_image_w"
     w_nominal: str = "w_nominal"
 
 
@@ -455,9 +455,9 @@ def main():
 
     # Branch overrides
     parser.add_argument("--branch-is-signal", default="is_signal")
-    parser.add_argument("--branch-u", default="detector_u")
-    parser.add_argument("--branch-v", default="detector_v")
-    parser.add_argument("--branch-w", default="detector_w")
+    parser.add_argument("--branch-u", default="detector_image_u")
+    parser.add_argument("--branch-v", default="detector_image_v")
+    parser.add_argument("--branch-w", default="detector_image_w")
     parser.add_argument("--branch-weight", default="w_nominal")
 
     args = parser.parse_args()
