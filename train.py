@@ -430,11 +430,12 @@ class BalancedSignalBackgroundBatchSampler(torch.utils.data.Sampler[List[int]]):
         labels: np.ndarray,
         samp_weights: np.ndarray,
         batch_size: int,
+        data_source: Optional[torch.utils.data.Dataset] = None,
         steps_per_epoch: Optional[int] = None,
         seed: int = 12345,
         shuffle_within_batch: bool = True,
     ):
-        super().__init__()
+        super().__init__(data_source)
         if batch_size % 2 != 0:
             raise ValueError("batch_size must be even to split equally between signal/background.")
         self.batch_size = int(batch_size)
