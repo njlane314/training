@@ -397,7 +397,7 @@ def train_one_epoch(model: nn.Module, loader, optimizer, criterion, device: torc
     model.train()
     total_loss = 0.0
     n_batches = 0
-    for x, y, _w in loader:
+    for batch_idx, (x, y, _w) in enumerate(loader, start=1):
         optimizer.zero_grad(set_to_none=True)
         out = model(x)
         logits = out.F  # (B,1)
@@ -405,6 +405,7 @@ def train_one_epoch(model: nn.Module, loader, optimizer, criterion, device: torc
         loss.backward()
         optimizer.step()
 
+        print(f"  batch {batch_idx:04d} | loss={loss.item():.6f}")
         total_loss += float(loss.item())
         n_batches += 1
     return total_loss / max(n_batches, 1)
