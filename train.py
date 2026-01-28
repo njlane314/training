@@ -1,38 +1,7 @@
 #!/usr/bin/env python3
-"""
-Train MinkUNetClassifier from a ROOT TTree with balanced (50/50) signal/background batches.
-
-Input ROOT branches expected (defaults; override via CLI):
-  - is_signal     (bool / int)         : event label (1=signal, 0=background)
-  - detector_image_u    (vector<float>)      : flattened U plane image, length = H*W
-  - detector_image_v    (vector<float>)      : flattened V plane image, length = H*W
-  - detector_image_w    (vector<float>)      : flattened W plane image, length = H*W
-  - w_nominal     (double / float)     : event weight (used for *within-class* weighted sampling)
-
-Key behavior:
-  - Each mini-batch is split equally: batch_size/2 signal + batch_size/2 background.
-  - Within each class, events are sampled with probability ∝ |w_nominal| (replacement sampling).
-  - Loss: Binary cross-entropy on logits (BCEWithLogitsLoss).
-
-Dependencies:
-  - torch, MinkowskiEngine
-  - uproot, awkward, numpy
-
-Example:
-  python train_minkunet.py \
-    --input train.root --tree Events \
-    --height 768 --width 768 \
-    --batch-size 8 --epochs 20 --lr 1e-3 \
-    --threshold 0.0 --device cuda \
-    --out checkpoint.pt
-"""
-
-import argparse
 import math
 import os
 import random
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -42,24 +11,20 @@ import uproot
 
 import MinkowskiEngine as ME
 
-# ---------- Model (as provided) ----------
+ROOT = os.environ.get("ROOT_FILE", "/gluster/data/dune/niclane/events.root")
+TREE = "events"
+OUT = os.environ.get("OUT", "checkpoint.pt")
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dimension):
         super().__init__()
-        self.conv1 = ME.MinkowskiConvolution(
-            in_channels, out_channels, kernel_size=3, dimension=dimension
-        )
+        self.conv1 = ME.MinkowskiConvolution(in_channels, out_channels, kernel_size=3, dimension=dimension)
         self.bn1 = ME.MinkowskiBatchNorm(out_channels)
-        self.conv2 = ME.MinkowskiConvolution(
-            out_channels, out_channels, kernel_size=3, dimension=dimension
-        )
+        self.conv2 = ME.MinkowskiConvolution(out_channels, out_channels, kernel_size=3, dimension=dimension)
         self.bn2 = ME.MinkowskiBatchNorm(out_channels)
         self.relu = ME.MinkowskiReLU(inplace=True)
         if in_channels != out_channels:
-            self.shortcut = ME.MinkowskiConvolution(
-                in_channels, out_channels, kernel_size=1, dimension=dimension
-            )
+            self.shortcut = ME.MinkowskiConvolution(in_channels, out_channels, kernel_size=1, dimension=dimension)
         else:
             self.shortcut = None
 
@@ -79,14 +44,8 @@ class InputNorm(nn.Module):
         self.log_scale = nn.Parameter(torch.zeros(num_channels))
 
     def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
-        F = x.F
-        scale = self.log_scale.exp()
-        F = (F - self.shift) * scale
-        return ME.SparseTensor(
-            features=F,
-            coordinate_map_key=x.coordinate_map_key,
-            coordinate_manager=x.coordinate_manager,
-        )
+        F = (x.F - self.shift) * self.log_scale.exp()
+        return ME.SparseTensor(features=F, coordinate_map_key=x.coordinate_map_key, coordinate_manager=x.coordinate_manager)
 
 
 class MinkUNetClassifier(nn.Module):
@@ -99,13 +58,11 @@ class MinkUNetClassifier(nn.Module):
         num_strides=3,
     ):
         super().__init__()
-        assert dimension == 3, "This model is configured for 3D coordinates (view,y,x)"
+        assert dimension == 3
 
         self.input_norm = InputNorm(in_channels)
 
-        self.conv0 = ME.MinkowskiConvolution(
-            in_channels, base_filters, kernel_size=3, dimension=dimension
-        )
+        self.conv0 = ME.MinkowskiConvolution(in_channels, base_filters, kernel_size=3, dimension=dimension)
         self.encoder = nn.ModuleList()
         ch = base_filters
         for _ in range(num_strides):
@@ -136,16 +93,12 @@ class MinkUNetClassifier(nn.Module):
             skip_ch = base_filters * (2 ** (num_strides - i))
             self.decoder.append(ResidualBlock(up + skip_ch, up, dimension))
             ch = up
-        self.bn_relu = nn.Sequential(
-            ME.MinkowskiBatchNorm(base_filters),
-            ME.MinkowskiReLU(inplace=True),
-        )
-        self.global_pool = ME.MinkowskiGlobalPooling()
+        self.bn_relu = nn.Sequential(ME.MinkowskiBatchNorm(base_filters), ME.MinkowskiReLU(inplace=True))
+        self.global_pool = ME.MinkowskiGlobalAvgPooling()
         self.linear = ME.MinkowskiLinear(base_filters, out_channels)
 
     def forward(self, x):
         x = self.input_norm(x)
-
         x = self.conv0(x)
         skips = []
         for i in range(0, len(self.encoder), 2):
@@ -164,567 +117,240 @@ class MinkUNetClassifier(nn.Module):
         return x
 
 
-def build_model():
-    return MinkUNetClassifier()
-
-# ---------- ROOT Dataset / Sampler ----------
-
-@dataclass
-class BranchNames:
-    is_signal: str = "is_signal"
-    u: str = "detector_image_u"
-    v: str = "detector_image_v"
-    w: str = "detector_image_w"
-    w_nominal: str = "w_nominal"
-
-
-class RootSparseImageDataset(torch.utils.data.Dataset):
-    """
-    Stores awkward arrays for U,V,W; returns sparse coords/features for MinkowskiEngine.
-    Coordinates are (view, y, x) with view in {0,1,2}.
-    """
-    def __init__(
-        self,
-        u_arr,
-        v_arr,
-        w_arr,
-        labels_np: np.ndarray,
-        weights_np: np.ndarray,
-        indices: np.ndarray,
-        height: int,
-        width: int,
-        threshold: float = 0.0,
-        eps_weight: float = 1e-12,
-    ):
-        super().__init__()
-        self.u_arr = u_arr
-        self.v_arr = v_arr
-        self.w_arr = w_arr
-
-        self.labels_all = labels_np.astype(np.int64)
-        self.weights_all = weights_np.astype(np.float64)
-
-        self.indices = indices.astype(np.int64)
-        self.H = int(height)
-        self.W = int(width)
-        self.threshold = float(threshold)
-        self.eps_weight = float(eps_weight)
-
-        if self.H <= 0 or self.W <= 0:
-            raise ValueError(f"Invalid image shape H={self.H}, W={self.W}")
-
-    def __len__(self) -> int:
-        return int(self.indices.shape[0])
-
-    def _plane_to_sparse(self, flat: np.ndarray, view_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        flat: shape (H*W,) float32/float64
-        Returns:
-          coords: (N,3) int32 (view,y,x)
-          feats : (N,1) float32
-        """
-        if flat.ndim != 1:
-            flat = flat.reshape(-1)
-        if flat.size != self.H * self.W:
-            raise ValueError(
-                f"Plane length {flat.size} != H*W ({self.H}*{self.W}={self.H*self.W}). "
-                "Pass correct --height/--width or fix input."
-            )
-
-        thr = self.threshold
-        if thr <= 0:
-            idx = np.flatnonzero(flat != 0)
-        else:
-            idx = np.flatnonzero(np.abs(flat) > thr)
-
-        if idx.size == 0:
-            return np.zeros((0, 3), dtype=np.int32), np.zeros((0, 1), dtype=np.float32)
-
-        y = (idx // self.W).astype(np.int32)
-        x = (idx % self.W).astype(np.int32)
-        v = np.full_like(y, int(view_idx), dtype=np.int32)
-
-        coords = np.stack([v, y, x], axis=1).astype(np.int32)  # (N,3)
-        feats = flat[idx].astype(np.float32).reshape(-1, 1)    # (N,1)
-        return coords, feats
-
-    def __getitem__(self, i: int):
-        entry = int(self.indices[i])
-
-        # awkward -> numpy
-        u = np.asarray(self.u_arr[entry], dtype=np.float32)
-        v = np.asarray(self.v_arr[entry], dtype=np.float32)
-        w = np.asarray(self.w_arr[entry], dtype=np.float32)
-
-        cu, fu = self._plane_to_sparse(u, 0)
-        cv, fv = self._plane_to_sparse(v, 1)
-        cw, fw = self._plane_to_sparse(w, 2)
-
-        coords = np.concatenate([cu, cv, cw], axis=0)
-        feats = np.concatenate([fu, fv, fw], axis=0)
-
-        # Handle completely empty event: MinkowskiEngine generally wants >=1 site.
-        if coords.shape[0] == 0:
-            coords = np.array([[0, 0, 0]], dtype=np.int32)
-            feats = np.array([[0.0]], dtype=np.float32)
-
-        y = float(self.labels_all[entry])
-        w_nom = float(self.weights_all[entry])
-        if not np.isfinite(w_nom):
-            w_nom = 0.0
-
-        # For sampling, we will use |w_nominal| clipped > 0.
-        w_samp = max(abs(w_nom), self.eps_weight)
-
-        # Return CPU tensors / numpy for ME.utils.sparse_collate
-        coords_t = torch.from_numpy(coords)      # int32
-        feats_t = torch.from_numpy(feats)        # float32
-        return coords_t, feats_t, y, w_samp
-
-
-class LazyRootSparseImageDataset(torch.utils.data.Dataset):
-    """
-    Lazy ROOT-backed dataset:
-      - keeps only per-event metadata (entry numbers, labels, weights) in memory
-      - reads U/V/W planes from the ROOT TTree on demand in __getitem__
-
-    Coordinates are (view, y, x) with view in {0,1,2}.
-    """
-
-    def __init__(
-        self,
-        root_file_path: str,
-        tree_name: str,
-        branches: BranchNames,
-        entries: np.ndarray,          # global entry numbers in the TTree
-        labels_local: np.ndarray,     # labels aligned with entries (0/1)
-        weights_local: np.ndarray,    # weights aligned with entries
-        height: int,
-        width: int,
-        threshold: float = 0.0,
-        eps_weight: float = 1e-12,
-    ):
-        super().__init__()
-        self.root_file_path = str(root_file_path)
-        self.tree_name = str(tree_name)
-        self.branches = branches
-
-        self.entries = np.asarray(entries, dtype=np.int64)
-        self.labels_local = np.asarray(labels_local, dtype=np.int64)
-        self.weights_local = np.asarray(weights_local, dtype=np.float64)
-
-        if not (len(self.entries) == len(self.labels_local) == len(self.weights_local)):
-            raise ValueError("entries, labels_local, weights_local must have the same length")
-
-        self.H = int(height)
-        self.W = int(width)
-        self.threshold = float(threshold)
-        self.eps_weight = float(eps_weight)
-
-        if self.H <= 0 or self.W <= 0:
-            raise ValueError(f"Invalid image shape H={self.H}, W={self.W}")
-
-        # Lazily opened per-process (important for DataLoader workers)
-        self._file = None
-        self._tree = None
-
-    def __len__(self) -> int:
-        return int(self.entries.shape[0])
-
-    def _get_tree(self):
-        # Open lazily in the current process/worker
-        if self._tree is None:
-            self._file = uproot.open(self.root_file_path)
-            self._tree = self._file[self.tree_name]
-        return self._tree
-
-    def _plane_to_sparse(self, flat: np.ndarray, view_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        flat: shape (H*W,)
-        Returns:
-          coords: (N,3) int32 (view,y,x)
-          feats : (N,1) float32
-        """
-        if flat.ndim != 1:
-            flat = flat.reshape(-1)
-
-        if flat.size != self.H * self.W:
-            raise ValueError(
-                f"Plane length {flat.size} != H*W ({self.H}*{self.W}={self.H*self.W}). "
-                "Pass correct --height/--width or fix input."
-            )
-
-        thr = self.threshold
-        if thr <= 0:
-            idx = np.flatnonzero(flat != 0)
-        else:
-            idx = np.flatnonzero(np.abs(flat) > thr)
-
-        if idx.size == 0:
-            return np.zeros((0, 3), dtype=np.int32), np.zeros((0, 1), dtype=np.float32)
-
-        y = (idx // self.W).astype(np.int32)
-        x = (idx % self.W).astype(np.int32)
-        v = np.full_like(y, int(view_idx), dtype=np.int32)
-
-        coords = np.stack([v, y, x], axis=1).astype(np.int32)
-        feats = flat[idx].astype(np.float32).reshape(-1, 1)
-        return coords, feats
-
-    def __getitem__(self, i: int):
-        entry = int(self.entries[i])
-        tree = self._get_tree()
-
-        # Read ONLY this event for U/V/W (no full preload)
-        # One I/O call for all three branches
-        data = tree.arrays(
-            [self.branches.u, self.branches.v, self.branches.w],
-            entry_start=entry,
-            entry_stop=entry + 1,
-            library="np",
-        )
-
-        u = np.asarray(data[self.branches.u][0], dtype=np.float32)
-        v = np.asarray(data[self.branches.v][0], dtype=np.float32)
-        w = np.asarray(data[self.branches.w][0], dtype=np.float32)
-
-        cu, fu = self._plane_to_sparse(u, 0)
-        cv, fv = self._plane_to_sparse(v, 1)
-        cw, fw = self._plane_to_sparse(w, 2)
-
-        coords = np.concatenate([cu, cv, cw], axis=0)
-        feats = np.concatenate([fu, fv, fw], axis=0)
-
-        # Handle completely empty event
-        if coords.shape[0] == 0:
-            coords = np.array([[0, 0, 0]], dtype=np.int32)
-            feats = np.array([[0.0]], dtype=np.float32)
-
-        y = float(self.labels_local[i])
-
-        w_nom = float(self.weights_local[i])
-        if not np.isfinite(w_nom):
-            w_nom = 0.0
-        w_samp = max(abs(w_nom), self.eps_weight)
-
-        return (
-            torch.from_numpy(coords),            # int32-ish
-            torch.from_numpy(feats),             # float32
-            y,
-            w_samp,
-        )
-
-
-class BalancedSignalBackgroundBatchSampler(torch.utils.data.Sampler[List[int]]):
-    """
-    Batch sampler that yields batches with:
-      - batch_size/2 signal indices
-      - batch_size/2 background indices
-    Within each class, samples with replacement using per-sample weights.
-
-    labels: array-like of shape (N,) with 0/1
-    samp_weights: array-like of shape (N,) positive weights used *within each class*
-    """
-    def __init__(
-        self,
-        labels: np.ndarray,
-        samp_weights: np.ndarray,
-        batch_size: int,
-        data_source: Optional[torch.utils.data.Dataset] = None,
-        steps_per_epoch: Optional[int] = None,
-        seed: int = 12345,
-        shuffle_within_batch: bool = True,
-    ):
-        super().__init__(data_source)
-        if batch_size % 2 != 0:
-            raise ValueError("batch_size must be even to split equally between signal/background.")
-        self.batch_size = int(batch_size)
-        self.half = self.batch_size // 2
-        self.shuffle_within_batch = bool(shuffle_within_batch)
-
-        labels = np.asarray(labels).astype(np.int64)
-        w = np.asarray(samp_weights).astype(np.float64)
-
-        self.sig_idx = np.where(labels == 1)[0]
-        self.bkg_idx = np.where(labels == 0)[0]
-        if self.sig_idx.size == 0 or self.bkg_idx.size == 0:
-            raise ValueError(
-                f"Need both classes in training set. Found n_sig={self.sig_idx.size}, n_bkg={self.bkg_idx.size}."
-            )
-
-        # Normalize weights within each class to probabilities
-        ws = w[self.sig_idx].copy()
-        wb = w[self.bkg_idx].copy()
-
-        # Ensure positivity
-        ws[~np.isfinite(ws)] = 0.0
-        wb[~np.isfinite(wb)] = 0.0
-        ws = np.clip(ws, 1e-12, None)
-        wb = np.clip(wb, 1e-12, None)
-
-        self.ps = ws / ws.sum()
-        self.pb = wb / wb.sum()
-
-        # Define epoch length (number of batches)
-        if steps_per_epoch is None:
-            # Roughly “one pass” over the larger class in terms of examples-per-epoch.
-            steps_per_epoch = int(math.ceil(max(self.sig_idx.size, self.bkg_idx.size) / self.half))
-        self.steps_per_epoch = int(steps_per_epoch)
-
-        self.seed = int(seed)
-        self._epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        self._epoch = int(epoch)
-
-    def __len__(self) -> int:
-        return self.steps_per_epoch
-
-    def __iter__(self):
-        rng = np.random.default_rng(self.seed + self._epoch)
-
-        for _ in range(self.steps_per_epoch):
-            sig = rng.choice(self.sig_idx, size=self.half, replace=True, p=self.ps)
-            bkg = rng.choice(self.bkg_idx, size=self.half, replace=True, p=self.pb)
-            batch = np.concatenate([sig, bkg]).astype(np.int64)
-            if self.shuffle_within_batch:
-                rng.shuffle(batch)
-            yield batch.tolist()
-
-# ---------- Collate + Train/Eval ----------
-
-def make_collate_fn():
-    def collate(batch):
-        coords_list = [b[0].int() for b in batch]    # (Ni,3)
-        feats_list = [b[1].float() for b in batch]  # (Ni,1)
-
-        y = torch.tensor([b[2] for b in batch], dtype=torch.float32).view(-1, 1)
-        w_samp = torch.tensor([b[3] for b in batch], dtype=torch.float32).view(-1, 1)
-
-        try:
-            coords, feats = ME.utils.sparse_collate(coords_list, feats_list)
-        except AttributeError:
-            coords = ME.utils.batched_coordinates(coords_list)
-            feats = torch.cat(feats_list, dim=0)
-
-        # Return CPU tensors; build SparseTensor on GPU in the train loop
-        return coords, feats, y, w_samp
-    return collate
-
-
-@torch.no_grad()
-def evaluate(model: nn.Module, loader, criterion, device: torch.device) -> float:
-    model.eval()
-    total_loss = 0.0
-    n_batches = 0
-    for coords, feats, y, _w in loader:
-        x = ME.SparseTensor(feats, coords, device=device)
-        y = y.to(device, non_blocking=True)
-
-        out = model(x)
-        logits = out.F
-        loss = criterion(logits, y).mean()
-        total_loss += float(loss.item())
-        n_batches += 1
-    return total_loss / max(n_batches, 1)
-
-
-def train_one_epoch(model: nn.Module, loader, optimizer, criterion, device: torch.device) -> float:
-    model.train()
-    total_loss = 0.0
-    n_batches = 0
-    for batch_idx, (coords, feats, y, _w) in enumerate(loader, start=1):
-        x = ME.SparseTensor(feats, coords, device=device)
-        y = y.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-        out = model(x)
-        logits = out.F
-        loss = criterion(logits, y).mean()
-        loss.backward()
-        optimizer.step()
-
-        print(f"  batch {batch_idx:04d} | loss={loss.item():.6f}")
-        total_loss += float(loss.item())
-        n_batches += 1
-    return total_loss / max(n_batches, 1)
-
-
-# ---------- Main ----------
-
-def stratified_split(labels: np.ndarray, val_frac: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    labels = np.asarray(labels).astype(np.int64)
+H = 512
+W = 512
+THRESH = 0.0
+BATCH = 32
+EPOCHS = 20
+LR = 1e-3
+WEIGHT_DECAY = 0.0
+VAL_FRAC = 0.1
+NUM_WORKERS = 8
+SEED = 12345
+
+BR_Y = "is_signal"
+BR_U = "detector_image_u"
+BR_V = "detector_image_v"
+BR_W = "detector_image_w"
+BR_WGT = "w_nominal"
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+def split(labels, frac, seed):
     rng = np.random.default_rng(seed)
-
-    all_idx = np.arange(labels.shape[0], dtype=np.int64)
-    sig = all_idx[labels == 1]
-    bkg = all_idx[labels == 0]
-
+    idx = np.arange(labels.shape[0], dtype=np.int64)
+    sig = idx[labels == 1]
+    bkg = idx[labels == 0]
     rng.shuffle(sig)
     rng.shuffle(bkg)
+    ns = int(round(sig.size * frac))
+    nb = int(round(bkg.size * frac))
+    val = np.concatenate([sig[:ns], bkg[:nb]])
+    trn = np.concatenate([sig[ns:], bkg[nb:]])
+    rng.shuffle(val)
+    rng.shuffle(trn)
+    return trn, val
 
-    n_sig_val = int(round(sig.size * val_frac))
-    n_bkg_val = int(round(bkg.size * val_frac))
 
-    val_idx = np.concatenate([sig[:n_sig_val], bkg[:n_bkg_val]])
-    train_idx = np.concatenate([sig[n_sig_val:], bkg[n_bkg_val:]])
+def plane_to_sparse(flat, view, H, W, thr):
+    if flat.ndim != 1:
+        flat = flat.reshape(-1)
+    if thr <= 0.0:
+        idx = np.flatnonzero(flat)
+    else:
+        idx = np.flatnonzero(np.abs(flat) > thr)
+    if idx.size == 0:
+        return None, None
+    y, x = np.divmod(idx.astype(np.int64, copy=False), W)
+    n = idx.size
+    coords = np.empty((n, 3), dtype=np.int32)
+    coords[:, 0] = int(view)
+    coords[:, 1] = y.astype(np.int32, copy=False)
+    coords[:, 2] = x.astype(np.int32, copy=False)
+    feats = flat[idx].astype(np.float32, copy=False).reshape(n, 1)
+    return coords, feats
 
-    rng.shuffle(val_idx)
-    rng.shuffle(train_idx)
-    return train_idx, val_idx
+
+class RootDataset(torch.utils.data.Dataset):
+    def __init__(self, path, tree, entries, labels, samp_w):
+        self.path = path
+        self.tree = tree
+        self.entries = entries.astype(np.int64, copy=False)
+        self.labels = labels.astype(np.float32, copy=False)
+        self.samp_w = samp_w.astype(np.float64, copy=False)
+        self._t = None
+        self._f = None
+
+    def _get(self):
+        if self._t is None:
+            self._f = uproot.open(self.path)
+            self._t = self._f[self.tree]
+        return self._t
+
+    def __len__(self):
+        return int(self.entries.shape[0])
+
+    def __getitem__(self, i):
+        entry = int(self.entries[i])
+        t = self._get()
+        a = t.arrays([BR_U, BR_V, BR_W], entry_start=entry, entry_stop=entry + 1, library="np")
+        u = a[BR_U][0]
+        v = a[BR_V][0]
+        w = a[BR_W][0]
+        cu, fu = plane_to_sparse(u, 0, H, W, THRESH)
+        cv, fv = plane_to_sparse(v, 1, H, W, THRESH)
+        cw, fw = plane_to_sparse(w, 2, H, W, THRESH)
+        coords = []
+        feats = []
+        if cu is not None:
+            coords.append(cu)
+            feats.append(fu)
+        if cv is not None:
+            coords.append(cv)
+            feats.append(fv)
+        if cw is not None:
+            coords.append(cw)
+            feats.append(fw)
+        if not coords:
+            c = np.array([[0, 0, 0]], dtype=np.int32)
+            f = np.array([[0.0]], dtype=np.float32)
+        else:
+            c = np.concatenate(coords, axis=0)
+            f = np.concatenate(feats, axis=0)
+        return torch.from_numpy(c), torch.from_numpy(f), float(self.labels[i])
+
+
+class BalancedBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, labels, samp_w, entries, batch_size, seed):
+        if batch_size % 2:
+            raise ValueError("batch_size must be even")
+        self.bs = int(batch_size)
+        self.h = self.bs // 2
+        self.labels = labels.astype(np.int64, copy=False)
+        self.entries = entries.astype(np.int64, copy=False)
+        w = np.clip(np.abs(samp_w.astype(np.float64, copy=False)), 1e-12, None)
+        self.sig = np.where(self.labels == 1)[0]
+        self.bkg = np.where(self.labels == 0)[0]
+        if self.sig.size == 0 or self.bkg.size == 0:
+            raise ValueError("need both classes")
+        ws = w[self.sig]
+        wb = w[self.bkg]
+        self.ps = ws / ws.sum()
+        self.pb = wb / wb.sum()
+        self.steps = int(math.ceil(max(self.sig.size, self.bkg.size) / self.h))
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, e):
+        self.epoch = int(e)
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        for _ in range(self.steps):
+            s = rng.choice(self.sig, size=self.h, replace=True, p=self.ps)
+            b = rng.choice(self.bkg, size=self.h, replace=True, p=self.pb)
+            batch = np.concatenate([s, b])
+            batch = batch[np.argsort(self.entries[batch])]
+            yield batch.tolist()
+
+
+def collate(batch):
+    coords, feats = ME.utils.sparse_collate([b[0] for b in batch], [b[1] for b in batch])
+    y = torch.tensor([b[2] for b in batch], dtype=torch.float32).view(-1, 1)
+    return coords, feats, y
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Input ROOT file")
-    parser.add_argument("--tree", required=True, help="TTree name")
-    parser.add_argument("--height", type=int, required=True, help="Image height H (drift-time bins)")
-    parser.add_argument("--width", type=int, required=True, help="Image width W (wire bins)")
-    parser.add_argument("--threshold", type=float, default=0.0, help="Active-site threshold (abs(value) > thr).")
-    parser.add_argument("--batch-size", type=int, default=8, help="Must be even (half signal, half background).")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--val-frac", type=float, default=0.1)
-    parser.add_argument("--steps-per-epoch", type=int, default=None, help="Override number of balanced batches per epoch.")
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--out", default="checkpoint.pt")
-
-    # Branch overrides
-    parser.add_argument("--branch-is-signal", default="is_signal")
-    parser.add_argument("--branch-u", default="detector_image_u")
-    parser.add_argument("--branch-v", default="detector_image_v")
-    parser.add_argument("--branch-w", default="detector_image_w")
-    parser.add_argument("--branch-weight", default="w_nominal")
-
-    args = parser.parse_args()
-
-    # Reproducibility
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device = torch.device(args.device)
+    with uproot.open(ROOT) as f:
+        t = f[TREE]
+        labels = t[BR_Y].array(library="np").astype(np.int64).reshape(-1)
+        w = t[BR_WGT].array(library="np").astype(np.float64).reshape(-1)
 
-    # Load ROOT (ONLY label + weight up front)
-    branches = BranchNames(
-        is_signal=args.branch_is_signal,
-        u=args.branch_u,
-        v=args.branch_v,
-        w=args.branch_w,
-        w_nominal=args.branch_weight,
-    )
+    trn_entries, val_entries = split(labels, VAL_FRAC, SEED)
+    trn_labels = labels[trn_entries]
+    val_labels = labels[val_entries]
+    trn_w = np.clip(np.abs(w[trn_entries]), 1e-12, None)
+    val_w = np.clip(np.abs(w[val_entries]), 1e-12, None)
 
-    with uproot.open(args.input) as f:
-        tree = f[args.tree]
-        labels = tree[branches.is_signal].array(library="np").astype(np.int64)
-        weights = tree[branches.w_nominal].array(library="np").astype(np.float64)
+    trn_ds = RootDataset(ROOT, TREE, trn_entries, trn_labels, trn_w)
+    val_ds = RootDataset(ROOT, TREE, val_entries, val_labels, val_w)
 
-    if labels.ndim != 1:
-        labels = labels.reshape(-1)
+    trn_bs = BalancedBatchSampler(trn_labels, trn_w, trn_entries, BATCH, SEED)
+    val_bs = BalancedBatchSampler(val_labels, val_w, val_entries, BATCH, SEED + 999)
 
-    # Train/val split (stratified)
-    train_idx_global, val_idx_global = stratified_split(labels, args.val_frac, args.seed)
-
-    # Local arrays aligned with the dataset order
-    train_labels_local = labels[train_idx_global]
-    train_weights_local = weights[train_idx_global]
-
-    val_labels_local = labels[val_idx_global]
-    val_weights_local = weights[val_idx_global]
-
-    train_ds = LazyRootSparseImageDataset(
-        root_file_path=args.input,
-        tree_name=args.tree,
-        branches=branches,
-        entries=train_idx_global,
-        labels_local=train_labels_local,
-        weights_local=train_weights_local,
-        height=args.height,
-        width=args.width,
-        threshold=args.threshold,
-    )
-    val_ds = LazyRootSparseImageDataset(
-        root_file_path=args.input,
-        tree_name=args.tree,
-        branches=branches,
-        entries=val_idx_global,
-        labels_local=val_labels_local,
-        weights_local=val_weights_local,
-        height=args.height,
-        width=args.width,
-        threshold=args.threshold,
-    )
-
-    # Build sampler using dataset-local indexing
-    train_w_local_for_sampling = np.clip(np.abs(train_weights_local), 1e-12, None)
-
-    batch_sampler = BalancedSignalBackgroundBatchSampler(
-        labels=train_labels_local,
-        samp_weights=train_w_local_for_sampling,
-        batch_size=args.batch_size,
-        steps_per_epoch=args.steps_per_epoch,
-        seed=args.seed,
-    )
-
-    collate_fn = make_collate_fn()
-
-    train_loader = torch.utils.data.DataLoader(
-        train_ds,
-        batch_sampler=batch_sampler,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_fn,
+    trn_loader = torch.utils.data.DataLoader(
+        trn_ds,
+        batch_sampler=trn_bs,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=(NUM_WORKERS > 0),
+        prefetch_factor=2 if NUM_WORKERS > 0 else None,
+        collate_fn=collate,
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_fn,
+        batch_sampler=val_bs,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=(NUM_WORKERS > 0),
+        prefetch_factor=2 if NUM_WORKERS > 0 else None,
+        collate_fn=collate,
     )
 
-    # Model / optimizer / loss
-    model = build_model().to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.BCEWithLogitsLoss(reduction="none")
+    model = MinkUNetClassifier().to(device)
+    opt = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    loss_fn = nn.BCEWithLogitsLoss()
 
-    # Train
-    best_val = float("inf")
-    for epoch in range(args.epochs):
-        # advance sampler epoch seed
-        if hasattr(batch_sampler, "set_epoch"):
-            batch_sampler.set_epoch(epoch)
+    best = float("inf")
+    step0 = 0
+    for epoch in range(EPOCHS):
+        trn_bs.set_epoch(epoch)
+        val_bs.set_epoch(epoch)
+        val_it = iter(val_loader)
+        model.train()
+        vmean = 0.0
+        for i, (coords, feats, y) in enumerate(trn_loader):
+            x = ME.SparseTensor(feats, coords, device=device)
+            y = y.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            logits = model(x).F
+            trn_loss = loss_fn(logits, y)
+            trn_loss.backward()
+            opt.step()
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss = evaluate(model, val_loader, criterion, device)
+            try:
+                vcoords, vfeats, vy = next(val_it)
+            except StopIteration:
+                val_it = iter(val_loader)
+                vcoords, vfeats, vy = next(val_it)
 
-        print(
-            f"Epoch {epoch+1:03d}/{args.epochs:03d} | "
-            f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f}"
-        )
+            model.eval()
+            with torch.no_grad():
+                vx = ME.SparseTensor(vfeats, vcoords, device=device)
+                vy = vy.to(device, non_blocking=True)
+                vloss = loss_fn(model(vx).F, vy)
+            model.train()
 
-        # Save best checkpoint
-        if val_loss < best_val:
-            best_val = val_loss
-            ckpt = {
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "args": vars(args),
-            }
-            torch.save(ckpt, args.out)
-            print(f"  -> saved: {args.out} (best val_loss so far)")
+            step = step0 + i + 1
+            vmean += (vloss.item() - vmean) / (i + 1)
+            print(f"{epoch+1:03d} {step:07d} train={trn_loss.item():.6f} val={vloss.item():.6f}")
 
-    print(f"Done. Best val_loss={best_val:.6f} (checkpoint: {args.out})")
+        step0 += len(trn_loader)
+        if vmean < best:
+            best = vmean
+            torch.save({"model": model.state_dict(), "epoch": epoch + 1, "val": best}, OUT)
 
 
 if __name__ == "__main__":
