@@ -122,7 +122,7 @@ class MinkUNetClassifier(nn.Module):
 H = 512
 W = 512
 THRESH = 0.0
-BATCH = 32
+BATCH = 8
 EPOCHS = 20
 LR = 1e-3
 WEIGHT_DECAY = 0.0
