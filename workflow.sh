@@ -17,7 +17,7 @@ python -c "import torch; print(torch.cuda.is_available())"
 # ==============================================================================
 
 ROOT_FILE="/gluster/data/dune/niclane/events.root"
-TREE_NAME="Events"
+TREE_NAME="events"
 PYTHON_SCRIPT="train.py"
 OUTPUT_WEIGHTS="./checkpoint.pt"
 
