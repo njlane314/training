@@ -2,11 +2,13 @@
 import math
 import os
 import random
+import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.multiprocessing as mp
 import uproot
 
 import MinkowskiEngine as ME
@@ -266,6 +268,14 @@ def collate(batch):
 
 
 def main():
+    try:
+        mp.set_start_method("forkserver", force=True)
+    except RuntimeError:
+        pass
+
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -296,17 +306,27 @@ def main():
         num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=(NUM_WORKERS > 0),
-        prefetch_factor=2 if NUM_WORKERS > 0 else None,
+        multiprocessing_context="forkserver" if NUM_WORKERS > 0 else None,
+        timeout=120 if NUM_WORKERS > 0 else 0,
         collate_fn=collate,
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds,
         batch_sampler=val_bs,
-        num_workers=NUM_WORKERS,
+        num_workers=0,
         pin_memory=True,
-        persistent_workers=(NUM_WORKERS > 0),
-        prefetch_factor=2 if NUM_WORKERS > 0 else None,
         collate_fn=collate,
+    )
+
+    t0 = time.time()
+    c, f, y = next(iter(trn_loader))
+    t1 = time.time()
+    vc, vf, vy = next(iter(val_loader))
+    t2 = time.time()
+    print(
+        f"warmup train_batch={t1-t0:.2f}s val_batch={t2-t1:.2f}s nnz={int(f.shape[0])} "
+        f"y_mean={float(y.mean()):.3f}",
+        flush=True,
     )
 
     model = MinkUNetClassifier().to(device)
@@ -345,7 +365,7 @@ def main():
 
             step = step0 + i + 1
             vmean += (vloss.item() - vmean) / (i + 1)
-            print(f"{epoch+1:03d} {step:07d} train={trn_loss.item():.6f} val={vloss.item():.6f}")
+            print(f"{epoch+1:03d} {step:07d} train={trn_loss.item():.6f} val={vloss.item():.6f}", flush=True)
 
         step0 += len(trn_loader)
         if vmean < best:
