@@ -2,6 +2,9 @@ import os
 
 
 def _env(name, default, cast):
+    """
+    @brief Read and cast an environment variable with a default.
+    """
     v = os.environ.get(name)
     return default if v is None else cast(v)
 

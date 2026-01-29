@@ -17,6 +17,9 @@ BR_WGT = os.environ.get("BR_WGT", "w_nominal")
 
 
 def plane_to_sparse(flat, view, H, W, thr, signlog):
+    """
+    @brief Transform a flattened plane into sparse coordinates with per-hit features.
+    """
     flat = np.asarray(flat, dtype=np.float32).reshape(-1)
     if flat.size != H * W:
         raise ValueError(f"plane size {flat.size} != {H}*{W}")
@@ -52,6 +55,9 @@ def plane_to_sparse(flat, view, H, W, thr, signlog):
 
 
 def event_to_sparse(u, v, w, H, W, thr, signlog):
+    """
+    @brief Merge U/V/W planes into a sparse event representation.
+    """
     coords = []
     feats = []
     for view, flat in enumerate((u, v, w)):
@@ -65,6 +71,9 @@ def event_to_sparse(u, v, w, H, W, thr, signlog):
 
 
 def pack_events(coords_list, feats_list, feat_dtype=np.float16):
+    """
+    @brief Pack per-event sparse tensors into a batched shard layout for serialisation.
+    """
     n = len(coords_list)
     starts = np.empty(n + 1, dtype=np.int64)
     starts[0] = 0
@@ -76,6 +85,9 @@ def pack_events(coords_list, feats_list, feat_dtype=np.float16):
 
 
 def write_shards_from_root():
+    """
+    @brief Write sparse shards from the configured ROOT file with progress reporting.
+    """
     out_dir = cfg.SHARDS_OUT
     os.makedirs(out_dir, exist_ok=True)
     for p in glob.glob(os.path.join(out_dir, "shard_*.pt")):
@@ -85,6 +97,9 @@ def write_shards_from_root():
         os.remove(idx_path)
 
     def render_progress(processed, total, width=32):
+        """
+        @brief Render a simple progress bar to stdout.
+        """
         if total <= 0:
             return
         ratio = min(max(processed / total, 0.0), 1.0)
@@ -180,7 +195,14 @@ def write_shards_from_root():
 
 
 class ShardDataset(torch.utils.data.Dataset):
+    """
+    @brief Dataset that loads sparse events from shard files with a small in-memory cache.
+    """
+
     def __init__(self, shards_dir, event_indices, cache_size=2):
+        """
+        @brief Initialise dataset metadata, indices, and the shard cache.
+        """
         meta = torch.load(os.path.join(shards_dir, "index.pt"), map_location="cpu")
         self.shards_dir = shards_dir
         self.shard_events = int(meta["shard_events"])
@@ -196,9 +218,15 @@ class ShardDataset(torch.utils.data.Dataset):
         self._cache = OrderedDict()
 
     def __len__(self):
+        """
+        @brief Return the number of indexed events.
+        """
         return int(self.event_indices.shape[0])
 
     def _load_shard(self, sid):
+        """
+        @brief Load a shard file into the cache, evicting old entries if needed.
+        """
         sid = int(sid)
         if sid in self._cache:
             self._cache.move_to_end(sid)
@@ -213,6 +241,9 @@ class ShardDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _slice_one(d, local):
+        """
+        @brief Slice a single event from a shard dictionary.
+        """
         local = int(local)
         s = int(d["starts"][local].item())
         e = int(d["starts"][local + 1].item())
@@ -221,6 +252,9 @@ class ShardDataset(torch.utils.data.Dataset):
         return c, f
 
     def __getitem__(self, i):
+        """
+        @brief Retrieve one event by dataset index.
+        """
         gi = int(self.event_indices[i])
         sid = int(gi // self.shard_events)
         d = self._load_shard(sid)
@@ -230,6 +264,9 @@ class ShardDataset(torch.utils.data.Dataset):
         return c, f, y
 
     def __getitems__(self, idxs):
+        """
+        @brief Retrieve multiple events by dataset indices.
+        """
         idxs = np.asarray(idxs, dtype=np.int64)
         gi = self.event_indices[idxs]
         sid = (gi // self.shard_events).astype(np.int64, copy=False)
@@ -256,7 +293,14 @@ class ShardDataset(torch.utils.data.Dataset):
 
 
 class BalancedBatchSampler(torch.utils.data.Sampler):
+    """
+    @brief Sampler that yields balanced signal/background batches for stable training.
+    """
+
     def __init__(self, labels, shard_ids, local_ids, batch_size, seed, steps=None):
+        """
+        @brief Initialise balanced batch sampling state.
+        """
         if batch_size % 2:
             raise ValueError("batch_size must be even")
         self.bs = int(batch_size)
@@ -273,12 +317,21 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
         self.epoch = 0
 
     def set_epoch(self, e):
+        """
+        @brief Set the sampler epoch for deterministic shuffling.
+        """
         self.epoch = int(e)
 
     def __len__(self):
+        """
+        @brief Return the number of batches per epoch.
+        """
         return self.steps
 
     def __iter__(self):
+        """
+        @brief Yield balanced batches of indices in a deterministic order per epoch.
+        """
         rng = np.random.default_rng(self.seed + self.epoch)
         for _ in range(self.steps):
             s = rng.choice(self.sig, size=self.h, replace=True)
@@ -289,6 +342,9 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
 
 
 def collate(batch):
+    """
+    @brief Collate sparse event tuples into MinkowskiEngine inputs and targets.
+    """
     import MinkowskiEngine as ME
 
     coords, feats = ME.utils.sparse_collate([b[0] for b in batch], [b[1] for b in batch])

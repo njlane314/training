@@ -8,7 +8,14 @@ DS = (1, 2, 2)
 
 
 class ResidualBlock(nn.Module):
+    """
+    @brief Residual block for sparse convolutional features with an optional skip projection.
+    """
+
     def __init__(self, in_ch, out_ch, dim=3):
+        """
+        @brief Initialise the residual block layers and optional shortcut convolution.
+        """
         super().__init__()
         self.c1 = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=KS, dimension=dim)
         self.b1 = ME.MinkowskiBatchNorm(out_ch)
@@ -18,6 +25,9 @@ class ResidualBlock(nn.Module):
         self.sc = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=1, dimension=dim) if in_ch != out_ch else None
 
     def forward(self, x):
+        """
+        @brief Apply the residual block and return the activated sum.
+        """
         i = x if self.sc is None else self.sc(x)
         x = self.r(self.b1(self.c1(x)))
         x = self.b2(self.c2(x))
@@ -25,18 +35,35 @@ class ResidualBlock(nn.Module):
 
 
 class InputNorm(nn.Module):
+    """
+    @brief Learnable input normalisation for sparse tensors.
+    """
+
     def __init__(self, c):
+        """
+        @brief Initialise per-channel shift and scale parameters.
+        """
         super().__init__()
         self.shift = nn.Parameter(torch.zeros(c))
         self.log_scale = nn.Parameter(torch.zeros(c))
 
     def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
+        """
+        @brief Apply normalisation to sparse tensor features.
+        """
         F = (x.F - self.shift) * self.log_scale.exp()
         return ME.SparseTensor(features=F, coordinate_map_key=x.coordinate_map_key, coordinate_manager=x.coordinate_manager)
 
 
 class MinkUNetClassifier(nn.Module):
+    """
+    @brief Sparse UNet classifier with global pooling and a compact classification head.
+    """
+
     def __init__(self, in_channels=4, base=32, strides=4, dropout=0.2):
+        """
+        @brief Build the encoder-decoder backbone and classification head.
+        """
         super().__init__()
         self.inorm = InputNorm(in_channels)
         self.c0 = ME.MinkowskiConvolution(in_channels, base, kernel_size=KS, dimension=3)
@@ -72,6 +99,9 @@ class MinkUNetClassifier(nn.Module):
         )
 
     def forward(self, x: ME.SparseTensor) -> torch.Tensor:
+        """
+        @brief Run the forward pass, pool globally, and emit logits.
+        """
         bs = int(x.C[:, 0].max().item()) + 1
         cnt = torch.bincount(x.C[:, 0], minlength=bs).to(dtype=torch.float32)
         log_cnt = torch.log1p(cnt).view(bs, 1)

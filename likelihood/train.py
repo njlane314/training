@@ -16,6 +16,9 @@ from .model import MinkUNetClassifier
 
 
 def stratified_split(labels, frac, seed):
+    """
+    @brief Split indices into stratified train/validation sets.
+    """
     rng = np.random.default_rng(seed)
     idx = np.arange(labels.shape[0], dtype=np.int64)
     sig = idx[labels == 1]
@@ -32,6 +35,9 @@ def stratified_split(labels, frac, seed):
 
 
 def fixed_probe_indices(labels, batch, seed):
+    """
+    @brief Select a fixed probe batch for validation monitoring.
+    """
     rng = np.random.default_rng(seed)
     h = batch // 2
     sig = np.where(labels == 1)[0]
@@ -46,6 +52,9 @@ def fixed_probe_indices(labels, batch, seed):
 
 
 def main():
+    """
+    @brief Train a MinkowskiEngine UNet classifier end-to-end.
+    """
     try:
         mp.set_start_method("forkserver", force=True)
     except RuntimeError:

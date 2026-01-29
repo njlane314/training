@@ -7,7 +7,14 @@ from likelihood.data import plane_to_sparse
 
 
 class TestFeatures(unittest.TestCase):
+    """
+    @brief Unit tests for feature extraction utilities.
+    """
+
     def test_relu_log_features(self):
+        """
+        @brief Validate relu-log feature encoding in plane_to_sparse.
+        """
         H, W = 4, 4
         flat = np.zeros(H * W, dtype=np.float32)
         flat[0] = 1.0
