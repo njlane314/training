@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
-import torchinfo
 # from torch.optim.lr_scheduler import LambdaLR
 
 import MinkowskiEngine as ME
@@ -174,14 +173,19 @@ def main():
     print(f"warmup {t1-t0:.2f}s nnz={int(f.shape[0])} y_mean={float(y.mean()):.3f}", flush=True)
     print("\n--- Model Summary (torchinfo) ---", flush=True)
     try:
-        summary = torchinfo.summary(
-            model,
-            input_data=(ME.SparseTensor(f, c, device=device),),
-            verbose=0,
-        )
-        print(summary, flush=True)
-    except Exception as exc:
-        print(f"torchinfo summary failed: {exc}", flush=True)
+        import torchinfo
+    except ModuleNotFoundError:
+        print("torchinfo not installed; skipping model summary.", flush=True)
+    else:
+        try:
+            summary = torchinfo.summary(
+                model,
+                input_data=(ME.SparseTensor(f, c, device=device),),
+                verbose=0,
+            )
+            print(summary, flush=True)
+        except Exception as exc:
+            print(f"torchinfo summary failed: {exc}", flush=True)
     print("--------------------------------------------------", flush=True)
 
     best = float("inf")
