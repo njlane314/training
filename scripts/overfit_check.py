@@ -43,9 +43,9 @@ def main():
     for step in range(1, 801):
         for coords, feats, y in loader:
             x = ME.SparseTensor(feats, coords, device=device)
-            y = y.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True).float().view(-1)
             opt.zero_grad(set_to_none=True)
-            logits = model(x)
+            logits = model(x).view(-1)
             loss = loss_fn(logits, y)
             loss.backward()
             opt.step()
@@ -63,8 +63,8 @@ def main():
     with torch.no_grad():
         for coords, feats, y in loader:
             x = ME.SparseTensor(feats, coords, device=device)
-            y = y.to(device, non_blocking=True)
-            p = (model(x) > 0).to(dtype=torch.float32)
+            y = y.to(device, non_blocking=True).float().view(-1)
+            p = (model(x).view(-1) > 0).to(dtype=torch.float32)
             cor += int(p.eq(y > 0.5).sum().item())
             tot += int(y.numel())
     acc = cor / max(tot, 1)

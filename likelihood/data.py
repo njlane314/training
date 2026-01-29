@@ -405,6 +405,18 @@ def collate(batch):
     """
     import MinkowskiEngine as ME
 
-    coords, feats = ME.utils.sparse_collate([b[0] for b in batch], [b[1] for b in batch])
-    y = torch.tensor([b[2] for b in batch], dtype=torch.float32).view(-1, 1)
+    coords_list = []
+    feats_list = []
+    for c, f, _ in batch:
+        if c.shape[1] == 2:
+            if isinstance(c, np.ndarray):
+                z = np.zeros((c.shape[0], 1), dtype=c.dtype)
+                c = np.concatenate([z, c], axis=1)
+            else:
+                z = torch.zeros((c.shape[0], 1), dtype=c.dtype)
+                c = torch.cat([z, c], dim=1)
+        coords_list.append(c)
+        feats_list.append(f)
+    coords, feats = ME.utils.sparse_collate(coords_list, feats_list)
+    y = torch.tensor([b[2] for b in batch], dtype=torch.float32)
     return coords, feats, y
