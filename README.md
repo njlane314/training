@@ -85,7 +85,7 @@ Training (`likelihood/train.py`) uses:
 
 - **Loss:** `BCEWithLogitsLoss` on the binary labels.
 - **Optimizer:** `AdamW`.
-- **LR schedule:** `OneCycleLR`.
+- **LR schedule:** none (flat learning rate).
 - **Validation:** a random probe batch from the validation set each step to track EMA of loss.
 - **Checkpoint:** best EMA validation loss (`checkpoint.pt` by default).
 
@@ -106,7 +106,7 @@ Training (`likelihood/train.py`) uses:
 | `CHUNK_EVENTS` | `64` | ROOT read chunk size |
 | `BATCH` | `32` | Batch size (must be even) |
 | `EPOCHS` | `20` | Number of epochs |
-| `LR` | `3e-4` | Peak learning rate |
+| `LR` | `3e-3` | Learning rate |
 | `WEIGHT_DECAY` | `1e-4` | AdamW weight decay |
 | `GRAD_CLIP` | `1.0` | Gradient clipping max norm |
 | `GRAD_ACCUM_STEPS` | `1` | Gradient accumulation steps |
@@ -133,7 +133,7 @@ export THRESH=0.0
 export ADC_SIGNLOG=0
 export BATCH=32
 export EPOCHS=20
-export LR=3e-4
+export LR=3e-3
 export OUT=checkpoint.pt
 ```
 

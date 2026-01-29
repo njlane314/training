@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
-from torch.optim.lr_scheduler import LambdaLR
+# from torch.optim.lr_scheduler import LambdaLR
 
 import MinkowskiEngine as ME
 
@@ -121,13 +121,13 @@ def main():
     print("--------------------------------------------------")
     opt = optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
     accum = max(1, int(cfg.GRAD_ACCUM_STEPS))
-    total_steps = cfg.EPOCHS * math.ceil(len(trn_loader) / accum)
-    sched = cosine_warmup(
-        opt,
-        total_steps=total_steps,
-        warmup_ratio=cfg.WARMUP_RATIO,
-        min_lr_ratio=cfg.MIN_LR_RATIO,
-    )
+    # total_steps = cfg.EPOCHS * math.ceil(len(trn_loader) / accum)
+    # sched = cosine_warmup(
+    #     opt,
+    #     total_steps=total_steps,
+    #     warmup_ratio=cfg.WARMUP_RATIO,
+    #     min_lr_ratio=cfg.MIN_LR_RATIO,
+    # )
     loss_fn = nn.BCEWithLogitsLoss()
 
     t0 = time.time()
@@ -173,7 +173,7 @@ def main():
                 stepped = False
                 if micro_step % accum == 0:
                     opt.step()
-                    sched.step()
+                    # sched.step()
                     stepped = True
 
                 model.eval()
@@ -210,7 +210,7 @@ def main():
 
             if micro_step % accum != 0:
                 opt.step()
-                sched.step()
+                # sched.step()
                 step0 += 1
                 micro_step = 0
 

@@ -34,7 +34,7 @@ export CHUNK_EVENTS=64
 
 export BATCH=32
 export EPOCHS=20
-export LR=3e-4
+export LR=3e-3
 export WEIGHT_DECAY=1e-4
 export NUM_WORKERS=8
 export SEED=12345
