@@ -63,7 +63,7 @@ Events are grouped into shards on disk to keep training I/O predictable:
 - Metadata in `index.pt` includes labels, weights, and non-zero counts.
 
 ### 3) Balanced batches
-The training loader uses `BalancedBatchSampler` to build class-balanced batches with `BATCH/2` signal and `BATCH/2` background each step. Each epoch resamples with a deterministic seed for reproducibility.
+The training loader uses `BalancedBatchSampler` to build class-balanced batches with `BATCH/2` signal and `BATCH/2` background each step. Each epoch runs a fixed number of steps (`STEPS_PER_EPOCH`, default 1000) and resamples with a deterministic seed for reproducibility.
 
 ## Model architecture
 
@@ -105,6 +105,7 @@ Training (`likelihood/train.py`) uses:
 | `SHARD_EVENTS` | `2048` | Events per shard |
 | `CHUNK_EVENTS` | `64` | ROOT read chunk size |
 | `BATCH` | `32` | Batch size (must be even) |
+| `STEPS_PER_EPOCH` | `1000` | Number of batches per epoch |
 | `EPOCHS` | `20` | Number of epochs |
 | `LR` | `3e-3` | Learning rate |
 | `WEIGHT_DECAY` | `1e-4` | AdamW weight decay |
