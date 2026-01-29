@@ -96,6 +96,9 @@ def main():
     model = MinkUNetClassifier(in_channels=4, base=cfg.BASE_FILTERS, strides=cfg.NUM_STRIDES, dropout=cfg.DROPOUT).to(
         device
     )
+    print("\n--- Model Architecture (MinkUNet Classifier) ---")
+    print(model)
+    print("--------------------------------------------------")
     opt = optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
     steps_per_epoch = len(trn_loader)
     sched = optim.lr_scheduler.OneCycleLR(

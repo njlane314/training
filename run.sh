@@ -10,6 +10,9 @@ conda activate /gluster/data/dune/niclane/miniforge/envs/hep-sparse-env
 
 python -c "import torch; print('cuda_available=', torch.cuda.is_available())"
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
+
 
 # ==============================================================================
 # ## --- Configuration (env vars consumed by likelihood/config.py) --- ##
@@ -54,7 +57,15 @@ python scripts/prepare_shards.py
 # ## --- Run Tests --- ##
 # ============================================================================== 
 
-python -m pytest -v
+if python - <<'PY'
+import importlib.util
+raise SystemExit(0 if importlib.util.find_spec("pytest") else 1)
+PY
+then
+  python -m pytest -v
+else
+  echo "pytest not available; skipping tests."
+fi
 
 
 # ==============================================================================
