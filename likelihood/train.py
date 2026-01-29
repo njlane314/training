@@ -173,11 +173,11 @@ def main():
             model.train()
             for i, (coords, feats, y) in enumerate(trn_loader):
                 x = ME.SparseTensor(feats, coords, device=device)
-                y = y.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True).float().view(-1)
 
                 if micro_step % accum == 0:
                     opt.zero_grad(set_to_none=True)
-                logits = model(x)
+                logits = model(x).view(-1)
                 tloss = loss_fn(logits, y)
                 tloss.backward()
                 micro_step += 1
@@ -193,8 +193,8 @@ def main():
                     vb = val_ds.__getitems__(probe_local)
                     vcoords, vfeats, vy = collate(vb)
                     vprobe_x = ME.SparseTensor(vfeats, vcoords, device=device)
-                    vprobe_y = vy.to(device, non_blocking=True)
-                    vlogits = model(vprobe_x)
+                    vprobe_y = vy.to(device, non_blocking=True).float().view(-1)
+                    vlogits = model(vprobe_x).view(-1)
                     vloss = loss_fn(vlogits, vprobe_y)
                 model.train()
 

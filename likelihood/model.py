@@ -123,9 +123,8 @@ class MinkUNetClassifier(nn.Module):
         """
         @brief Run the forward pass, pool globally, and emit logits.
         """
-        bs = int(x.C[:, 0].max().item()) + 1
-        cnt = torch.bincount(x.C[:, 0], minlength=bs).to(dtype=torch.float32)
-        log_cnt = torch.log1p(cnt).view(bs, 1)
+        batch_ids = x.C[:, 0].to(dtype=torch.int64)
+        uniq, cnt = torch.unique(batch_ids, sorted=True, return_counts=True)
 
         x = self.inorm(x)
         x = self.c0(x)
@@ -143,8 +142,13 @@ class MinkUNetClassifier(nn.Module):
             x = self.dec[i + 1](x)
 
         x = self.drop(self.bn(x))
-        s = self.p_sum(x).F
-        m = self.p_max(x).F
+        p_sum = self.p_sum(x)
+        p_max = self.p_max(x)
+        s = p_sum.F
+        m = p_max.F
         z = torch.cat([s, m], dim=1)
-        z = torch.cat([z, log_cnt.to(z.device, non_blocking=True)], dim=1)
+        out_batch_ids = p_sum.C[:, 0].to(dtype=torch.int64)
+        pos = torch.searchsorted(uniq, out_batch_ids)
+        log_cnt = torch.log1p(cnt[pos].to(dtype=torch.float32))
+        z = torch.cat([z, log_cnt.to(z.device, non_blocking=True).view(-1, 1)], dim=1)
         return self.head(z)
