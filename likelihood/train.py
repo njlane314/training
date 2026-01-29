@@ -126,6 +126,9 @@ def main():
     model = MinkUNetClassifier(in_channels=4, base=cfg.BASE_FILTERS, strides=cfg.NUM_STRIDES, dropout=cfg.DROPOUT).to(
         device
     )
+    # Weight-movement probes (simple, robust: linear head weights are always torch.Parameters)
+    w_head0_0 = model.head[0].weight.detach().clone()
+    w_head1_0 = model.head[-1].weight.detach().clone()
     print("\n--- Model Architecture (MinkUNet Classifier) ---")
     print(model)
     print("--------------------------------------------------")
@@ -177,8 +180,6 @@ def main():
                 logits = model(x)
                 tloss = loss_fn(logits, y)
                 tloss.backward()
-                if cfg.GRAD_CLIP > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
                 micro_step += 1
                 stepped = False
                 if micro_step % accum == 0:
@@ -213,6 +214,21 @@ def main():
                     f"ema={ema_t:.6f}/{ema_v:.6f} acc={tacc:.3f} vacc={vacc:.3f}"
                 )
                 print(line, flush=True)
+                # Debug prints: logits/statistics + weight movement every 50 optimizer steps
+                if stepped and (step % 50 == 0):
+                    with torch.no_grad():
+                        l_mu = float(logits.mean().item())
+                        l_sd = float(logits.std(unbiased=False).item())
+                        p = torch.sigmoid(logits)
+                        p_mu = float(p.mean().item())
+                        p_sd = float(p.std(unbiased=False).item())
+                        dw0 = float((model.head[0].weight.detach() - w_head0_0).abs().mean().item())
+                        dw1 = float((model.head[-1].weight.detach() - w_head1_0).abs().mean().item())
+                    print(
+                        f"    logits μ/σ={l_mu:+.3e}/{l_sd:.3e}  p μ/σ={p_mu:.3f}/{p_sd:.3f}  "
+                        f"ΔW_head0={dw0:.3e}  ΔW_head1={dw1:.3e}",
+                        flush=True,
+                    )
                 if log_writer is not None:
                     log_writer.writerow(
                         [epoch + 1, step, lr, tl, vl, ema_t, ema_v, tacc, vacc]

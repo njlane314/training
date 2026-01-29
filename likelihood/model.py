@@ -3,8 +3,29 @@ import torch.nn as nn
 
 import MinkowskiEngine as ME
 
-KS = (1, 3, 3)
+# Allow cross-view convolution (mix U/V/W through the "view" coordinate axis)
+KS = (3, 3, 3)
 DS = (1, 2, 2)
+
+
+class MinkowskiLayerNorm(nn.Module):
+    """
+    @brief LayerNorm over channels for MinkowskiEngine SparseTensors.
+
+    This avoids BatchNorm running-stat instability on sparse, highly variable nnz events.
+    """
+
+    def __init__(self, c: int, eps: float = 1e-5, affine: bool = True):
+        super().__init__()
+        self.ln = nn.LayerNorm(c, eps=eps, elementwise_affine=affine)
+
+    def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
+        F = self.ln(x.F)
+        return ME.SparseTensor(
+            features=F,
+            coordinate_map_key=x.coordinate_map_key,
+            coordinate_manager=x.coordinate_manager,
+        )
 
 
 class ResidualBlock(nn.Module):
@@ -18,9 +39,9 @@ class ResidualBlock(nn.Module):
         """
         super().__init__()
         self.c1 = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=KS, dimension=dim)
-        self.b1 = ME.MinkowskiBatchNorm(out_ch)
+        self.n1 = MinkowskiLayerNorm(out_ch)
         self.c2 = ME.MinkowskiConvolution(out_ch, out_ch, kernel_size=KS, dimension=dim)
-        self.b2 = ME.MinkowskiBatchNorm(out_ch)
+        self.n2 = MinkowskiLayerNorm(out_ch)
         self.r = ME.MinkowskiReLU(inplace=True)
         self.sc = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=1, dimension=dim) if in_ch != out_ch else None
 
@@ -29,8 +50,8 @@ class ResidualBlock(nn.Module):
         @brief Apply the residual block and return the activated sum.
         """
         i = x if self.sc is None else self.sc(x)
-        x = self.r(self.b1(self.c1(x)))
-        x = self.b2(self.c2(x))
+        x = self.r(self.n1(self.c1(x)))
+        x = self.n2(self.c2(x))
         return self.r(x + i)
 
 
@@ -85,7 +106,7 @@ class MinkUNetClassifier(nn.Module):
             self.dec.append(ResidualBlock(up + skip, up))
             ch = up
 
-        self.bn = nn.Sequential(ME.MinkowskiBatchNorm(base), ME.MinkowskiReLU(inplace=True))
+        self.bn = nn.Sequential(MinkowskiLayerNorm(base), ME.MinkowskiReLU(inplace=True))
         self.drop = ME.MinkowskiDropout(dropout)
         self.p_sum = ME.MinkowskiGlobalPooling()
         self.p_max = ME.MinkowskiGlobalMaxPooling()
