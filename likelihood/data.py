@@ -1,6 +1,9 @@
+import faulthandler
 import glob
 import os
+import signal
 import sys
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -96,17 +99,25 @@ def write_shards_from_root():
     if os.path.exists(idx_path):
         os.remove(idx_path)
 
+    faulthandler.dump_traceback_later(300, repeat=True)
+    faulthandler.register(signal.SIGUSR1)
+
+    last_msg_len = 0
+
     def render_progress(processed, total, width=32, stage="processing"):
         """
         @brief Render a simple progress bar to stdout.
         """
+        nonlocal last_msg_len
         if total <= 0:
             return
         ratio = min(max(processed / total, 0.0), 1.0)
         filled = int(width * ratio)
         bar = "=" * filled + "-" * (width - filled)
-        msg = f"\r{stage.title()} events [{bar}] {processed}/{total} ({ratio:.1%})"
-        print(msg, end="", file=sys.stdout, flush=True)
+        msg = f"{stage.title()} events [{bar}] {processed}/{total} ({ratio:.1%})"
+        padding = " " * max(0, last_msg_len - len(msg))
+        print(f"\r{msg}{padding}", end="", file=sys.stdout, flush=True)
+        last_msg_len = len(msg)
 
     with uproot.open(cfg.ROOT_FILE) as f:
         t = f[cfg.TREE]
@@ -125,21 +136,27 @@ def write_shards_from_root():
         for start in range(0, n_events, cfg.CHUNK_EVENTS):
             stop = min(start + cfg.CHUNK_EVENTS, n_events)
             render_progress(start, n_events, stage="loading")
+            t0 = time.perf_counter()
             a = t.arrays([BR_U, BR_V, BR_W], entry_start=start, entry_stop=stop, library="np")
+            t1 = time.perf_counter()
             uu = a[BR_U]
             vv = a[BR_V]
             ww = a[BR_W]
+            max_nnz_in_chunk = 0
 
             for j in range(stop - start):
                 gi = start + j
                 c, fe = event_to_sparse(uu[j], vv[j], ww[j], cfg.H, cfg.W, cfg.THRESH, cfg.ADC_SIGNLOG)
+                max_nnz_in_chunk = max(max_nnz_in_chunk, int(c.shape[0]))
                 nnz[gi] = int(c.shape[0])
                 coords_list.append(c)
                 feats_list.append(fe)
                 y_local.append(int(labels[gi]))
 
                 if len(y_local) == cfg.SHARD_EVENTS:
+                    t2 = time.perf_counter()
                     coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
+                    t3 = time.perf_counter()
                     shard_path = os.path.join(out_dir, f"shard_{shard_id:05d}.pt")
                     torch.save(
                         {
@@ -152,12 +169,24 @@ def write_shards_from_root():
                         },
                         shard_path,
                     )
+                    t4 = time.perf_counter()
+                    print(
+                        f"\nshard {shard_id:05d} @event {gi} "
+                        f"read_chunk={t1 - t0:.3f}s pack={t3 - t2:.3f}s save={t4 - t3:.3f}s",
+                        flush=True,
+                    )
                     shard_id += 1
                     shard_start = gi + 1
                     coords_list.clear()
                     feats_list.clear()
                     y_local.clear()
-            render_progress(stop, n_events, stage="processing")
+            t5 = time.perf_counter()
+            print(
+                f"\nchunk {start}:{stop} read={t1 - t0:.3f}s proc={t5 - t1:.3f}s "
+                f"max_nnz={max_nnz_in_chunk}",
+                flush=True,
+            )
+            render_progress(stop, n_events)
 
         if y_local:
             coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
