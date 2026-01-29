@@ -4,9 +4,9 @@
 # ## --- Environment Setup --- ##
 # ==============================================================================
 
-# Activate your environment (edit as needed for your system).
-source /path/to/miniforge/etc/profile.d/conda.sh
-conda activate /path/to/envs/hep-sparse-env
+echo "Activating Conda environment..."
+source /gluster/data/dune/niclane/miniforge/etc/profile.d/conda.sh
+conda activate /gluster/data/dune/niclane/miniforge/envs/hep-sparse-env
 
 python -c "import torch; print('cuda_available=', torch.cuda.is_available())"
 
