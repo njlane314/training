@@ -103,12 +103,22 @@ def write_shards_from_root():
     faulthandler.register(signal.SIGUSR1)
 
     last_msg_len = 0
+    use_tty = sys.stdout.isatty()
 
     def render_progress(processed, total, width=32, stage="processing"):
         """
         @brief Render a simple progress bar to stdout.
         """
         nonlocal last_msg_len
+        if not use_tty:
+            if processed < total:
+                return
+            ratio = min(max(processed / total, 0.0), 1.0)
+            filled = int(width * ratio)
+            bar = "=" * filled + "-" * (width - filled)
+            msg = f"{stage.title()} events [{bar}] {processed}/{total} ({ratio:.1%})"
+            print(msg, file=sys.stdout, flush=True)
+            return
         if total <= 0:
             return
         ratio = min(max(processed / total, 0.0), 1.0)
@@ -116,7 +126,7 @@ def write_shards_from_root():
         bar = "=" * filled + "-" * (width - filled)
         msg = f"{stage.title()} events [{bar}] {processed}/{total} ({ratio:.1%})"
         padding = " " * max(0, last_msg_len - len(msg))
-        print(f"\r{msg}{padding}", end="", file=sys.stdout, flush=True)
+        print(f"\r\033[2K{msg}{padding}", end="", file=sys.stdout, flush=True)
         last_msg_len = len(msg)
 
     with uproot.open(cfg.ROOT_FILE) as f:
