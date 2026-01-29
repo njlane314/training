@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import random
 import time
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
+from torch.optim.lr_scheduler import LambdaLR
 
 import MinkowskiEngine as ME
 
@@ -49,6 +51,19 @@ def sample_probe_indices(labels, batch, rng):
     p = np.concatenate([s, b]).astype(np.int64, copy=False)
     rng.shuffle(p)
     return p
+
+
+def cosine_warmup(optimizer, total_steps: int, warmup_ratio: float = 0.02, min_lr_ratio: float = 0.05):
+    warmup_steps = int(total_steps * warmup_ratio)
+    warmup_steps = max(1, min(warmup_steps, total_steps - 1))
+
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * t))
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 def main():
@@ -105,15 +120,13 @@ def main():
     print(model)
     print("--------------------------------------------------")
     opt = optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
-    steps_per_epoch = len(trn_loader)
-    sched = optim.lr_scheduler.OneCycleLR(
+    accum = max(1, int(cfg.GRAD_ACCUM_STEPS))
+    total_steps = cfg.EPOCHS * math.ceil(len(trn_loader) / accum)
+    sched = cosine_warmup(
         opt,
-        max_lr=cfg.LR,
-        epochs=cfg.EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.05,
-        div_factor=10.0,
-        final_div_factor=100.0,
+        total_steps=total_steps,
+        warmup_ratio=cfg.WARMUP_RATIO,
+        min_lr_ratio=cfg.MIN_LR_RATIO,
     )
     loss_fn = nn.BCEWithLogitsLoss()
 
@@ -126,6 +139,7 @@ def main():
     ema_t = None
     ema_v = None
     step0 = 0
+    micro_step = 0
 
     log_handle = None
     log_writer = None
@@ -148,14 +162,19 @@ def main():
                 x = ME.SparseTensor(feats, coords, device=device)
                 y = y.to(device, non_blocking=True)
 
-                opt.zero_grad(set_to_none=True)
+                if micro_step % accum == 0:
+                    opt.zero_grad(set_to_none=True)
                 logits = model(x)
                 tloss = loss_fn(logits, y)
                 tloss.backward()
                 if cfg.GRAD_CLIP > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-                opt.step()
-                sched.step()
+                micro_step += 1
+                stepped = False
+                if micro_step % accum == 0:
+                    opt.step()
+                    sched.step()
+                    stepped = True
 
                 model.eval()
                 with torch.no_grad():
@@ -176,7 +195,9 @@ def main():
                 tacc = (logits > 0).eq(y > 0.5).float().mean().item()
                 vacc = (vlogits > 0).eq(vprobe_y > 0.5).float().mean().item()
                 lr = opt.param_groups[0]["lr"]
-                step = step0 + i + 1
+                if stepped:
+                    step0 += 1
+                step = step0
                 line = (
                     f"{epoch+1:03d} {step:07d} lr={lr:.2e} train={tl:.6f} val={vl:.6f} "
                     f"ema={ema_t:.6f}/{ema_v:.6f} acc={tacc:.3f} vacc={vacc:.3f}"
@@ -187,7 +208,12 @@ def main():
                         [epoch + 1, step, lr, tl, vl, ema_t, ema_v, tacc, vacc]
                     )
 
-            step0 += len(trn_loader)
+            if micro_step % accum != 0:
+                opt.step()
+                sched.step()
+                step0 += 1
+                micro_step = 0
+
             if ema_v is not None and ema_v < best:
                 best = float(ema_v)
                 torch.save(
