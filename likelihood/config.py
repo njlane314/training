@@ -26,7 +26,7 @@ CHUNK_EVENTS = _env("CHUNK_EVENTS", 64, int)
 
 BATCH = _env("BATCH", 32, int)
 EPOCHS = _env("EPOCHS", 20, int)
-LR = _env("LR", 3e-4, float)
+LR = _env("LR", 3e-3, float)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 1e-4, float)
 NUM_WORKERS = _env("NUM_WORKERS", 8, int)
 SEED = _env("SEED", 12345, int)
