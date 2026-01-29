@@ -9,9 +9,9 @@ import torch.optim as optim
 
 import MinkowskiEngine as ME
 
-from hep_sparse import config as cfg
-from hep_sparse.data import ShardDataset, collate
-from hep_sparse.model import MinkUNetClassifier
+from likelihood import config as cfg
+from likelihood.data import ShardDataset, collate
+from likelihood.model import MinkUNetClassifier
 
 
 def main():

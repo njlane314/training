@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from hep_sparse.data import plane_to_sparse
+from likelihood.data import plane_to_sparse
 
 
 class TestFeatures(unittest.TestCase):

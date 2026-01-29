@@ -14,7 +14,7 @@ python -c "import torch; print('cuda_available=', torch.cuda.is_available())"
 
 
 # ==============================================================================
-# ## --- Configuration (env vars consumed by hep_sparse/config.py) --- ##
+# ## --- Configuration (env vars consumed by likelihood/config.py) --- ##
 # ==============================================================================
 
 export ROOT_FILE="/gluster/data/dune/niclane/events.root"
@@ -71,4 +71,3 @@ python scripts/overfit_check.py
 # ============================================================================== 
 
 python train.py
-
