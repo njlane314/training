@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
+import torchinfo
 # from torch.optim.lr_scheduler import LambdaLR
 
 import MinkowskiEngine as ME
@@ -64,6 +65,29 @@ def cosine_warmup(optimizer, total_steps: int, warmup_ratio: float = 0.02, min_l
         return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * t))
 
     return LambdaLR(optimizer, lr_lambda)
+
+
+def attach_grad_hooks(model: nn.Module):
+    handles = []
+
+    def bwd_hook(mod, grad_input, grad_output):
+        # grad_output is a tuple; take first tensor-like entry if present
+        go = None
+        if isinstance(grad_output, (tuple, list)) and len(grad_output) > 0:
+            go = grad_output[0]
+        if go is None or not torch.is_tensor(go):
+            return
+        g = go.detach()
+        gnorm = float(g.float().norm().item())
+        gmax = float(g.float().abs().max().item())
+        print(f"    [bwd] {mod.__class__.__name__:<24} ‖g‖={gnorm:.3e} max|g|={gmax:.3e}", flush=True)
+
+    for m in model.modules():
+        # avoid very noisy hooks unless you want everything
+        if isinstance(m, (ME.MinkowskiConvolution, ME.MinkowskiBatchNorm, ME.MinkowskiLinear)):
+            handles.append(m.register_full_backward_hook(bwd_hook))
+
+    return handles
 
 
 def main():
@@ -126,6 +150,7 @@ def main():
     model = MinkUNetClassifier(in_channels=4, base=cfg.BASE_FILTERS, strides=cfg.NUM_STRIDES, dropout=cfg.DROPOUT).to(
         device
     )
+    grad_handles = attach_grad_hooks(model)
     # Weight-movement probes (simple, robust: linear head weights are always torch.Parameters)
     w_head0_0 = model.head[0].weight.detach().clone()
     w_head1_0 = model.head[-1].weight.detach().clone()
@@ -147,6 +172,17 @@ def main():
     c, f, y = next(iter(trn_loader))
     t1 = time.time()
     print(f"warmup {t1-t0:.2f}s nnz={int(f.shape[0])} y_mean={float(y.mean()):.3f}", flush=True)
+    print("\n--- Model Summary (torchinfo) ---", flush=True)
+    try:
+        summary = torchinfo.summary(
+            model,
+            input_data=(ME.SparseTensor(f, c, device=device),),
+            verbose=0,
+        )
+        print(summary, flush=True)
+    except Exception as exc:
+        print(f"torchinfo summary failed: {exc}", flush=True)
+    print("--------------------------------------------------", flush=True)
 
     best = float("inf")
     ema_t = None
@@ -256,5 +292,7 @@ def main():
 
         torch.save({"epoch": int(cfg.EPOCHS), "step": int(step0), "model": model.state_dict()}, cfg.OUT)
     finally:
+        for handle in grad_handles:
+            handle.remove()
         if log_handle is not None:
             log_handle.close()
