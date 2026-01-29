@@ -1,5 +1,6 @@
 import glob
 import os
+import sys
 from collections import OrderedDict
 
 import numpy as np
@@ -83,6 +84,15 @@ def write_shards_from_root():
     if os.path.exists(idx_path):
         os.remove(idx_path)
 
+    def render_progress(processed, total, width=32):
+        if total <= 0:
+            return
+        ratio = min(max(processed / total, 0.0), 1.0)
+        filled = int(width * ratio)
+        bar = "=" * filled + "-" * (width - filled)
+        msg = f"\rProcessing events [{bar}] {processed}/{total} ({ratio:.1%})"
+        print(msg, end="", file=sys.stdout, flush=True)
+
     with uproot.open(cfg.ROOT_FILE) as f:
         t = f[cfg.TREE]
         labels = t[BR_Y].array(library="np").astype(np.uint8).reshape(-1)
@@ -131,6 +141,7 @@ def write_shards_from_root():
                     coords_list.clear()
                     feats_list.clear()
                     y_local.clear()
+            render_progress(stop, n_events)
 
         if y_local:
             coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
@@ -147,6 +158,9 @@ def write_shards_from_root():
                 shard_path,
             )
             shard_id += 1
+
+    if n_events:
+        print(file=sys.stdout, flush=True)
 
     torch.save(
         {
