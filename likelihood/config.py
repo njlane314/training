@@ -25,6 +25,7 @@ SHARD_EVENTS = _env("SHARD_EVENTS", 2048, int)
 CHUNK_EVENTS = _env("CHUNK_EVENTS", 64, int)
 
 BATCH = _env("BATCH", 32, int)
+STEPS_PER_EPOCH = _env("STEPS_PER_EPOCH", 1000, int)
 EPOCHS = _env("EPOCHS", 20, int)
 LR = _env("LR", 3e-3, float)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 1e-4, float)

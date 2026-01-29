@@ -101,7 +101,14 @@ def main():
     trn_ds = ShardDataset(cfg.SHARDS_DIR, trn_idx)
     val_ds = ShardDataset(cfg.SHARDS_DIR, val_idx)
 
-    trn_bs = BalancedBatchSampler(trn_ds.labels, trn_ds.shard_ids, trn_ds.local_ids, cfg.BATCH, cfg.SEED)
+    trn_bs = BalancedBatchSampler(
+        trn_ds.labels,
+        trn_ds.shard_ids,
+        trn_ds.local_ids,
+        cfg.BATCH,
+        cfg.SEED,
+        steps=cfg.STEPS_PER_EPOCH,
+    )
     trn_loader = torch.utils.data.DataLoader(
         trn_ds,
         batch_sampler=trn_bs,
