@@ -108,12 +108,16 @@ Training (`likelihood/train.py`) uses:
 | `EPOCHS` | `20` | Number of epochs |
 | `LR` | `3e-4` | Peak learning rate |
 | `WEIGHT_DECAY` | `1e-4` | AdamW weight decay |
+| `GRAD_CLIP` | `1.0` | Gradient clipping max norm |
+| `GRAD_ACCUM_STEPS` | `1` | Gradient accumulation steps |
+| `WARMUP_RATIO` | `0.02` | Warmup fraction of total steps |
+| `MIN_LR_RATIO` | `0.05` | Minimum LR ratio during cosine decay |
 | `NUM_WORKERS` | `8` | DataLoader workers |
 | `SEED` | `12345` | Random seed |
 | `VAL_FRAC` | `0.1` | Validation fraction |
 | `OUT` | `checkpoint.pt` | Checkpoint path |
 | `BASE_FILTERS` | `32` | Base feature width |
-| `NUM_STRIDES` | `4` | Encoder/decoder depth |
+| `NUM_STRIDES` | `3` | Encoder/decoder depth |
 | `DROPOUT` | `0.2` | Dropout probability |
 
 ### Example configuration
