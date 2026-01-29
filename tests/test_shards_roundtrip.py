@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import torch
 
-from hep_sparse.data import ShardDataset, pack_events
+from likelihood.data import ShardDataset, pack_events
 
 
 class TestShardsRoundTrip(unittest.TestCase):

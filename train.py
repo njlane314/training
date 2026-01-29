@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from hep_sparse.train import main
+from likelihood.train import main
 
 if __name__ == "__main__":
     main()
