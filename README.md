@@ -86,7 +86,7 @@ Training (`likelihood/train.py`) uses:
 - **Loss:** `BCEWithLogitsLoss` on the binary labels.
 - **Optimizer:** `AdamW`.
 - **LR schedule:** `OneCycleLR`.
-- **Validation:** a fixed probe batch from the validation set to track a stable EMA of loss.
+- **Validation:** a random probe batch from the validation set each step to track EMA of loss.
 - **Checkpoint:** best EMA validation loss (`checkpoint.pt` by default).
 
 ## Configuration (environment variables)

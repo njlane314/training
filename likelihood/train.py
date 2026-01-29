@@ -35,11 +35,10 @@ def stratified_split(labels, frac, seed):
     return trn, val
 
 
-def fixed_probe_indices(labels, batch, seed):
+def sample_probe_indices(labels, batch, rng):
     """
-    @brief Select a fixed probe batch for validation monitoring.
+    @brief Select a random probe batch for validation monitoring.
     """
-    rng = np.random.default_rng(seed)
     h = batch // 2
     sig = np.where(labels == 1)[0]
     bkg = np.where(labels == 0)[0]
@@ -97,11 +96,7 @@ def main():
         collate_fn=collate,
     )
 
-    probe_local = fixed_probe_indices(val_ds.labels, cfg.BATCH, cfg.SEED + 999)
-    vb = val_ds.__getitems__(probe_local)
-    vcoords, vfeats, vy = collate(vb)
-    vprobe_x = ME.SparseTensor(vfeats, vcoords, device=device)
-    vprobe_y = vy.to(device, non_blocking=True)
+    probe_rng = np.random.default_rng(cfg.SEED + 999)
 
     model = MinkUNetClassifier(in_channels=4, base=cfg.BASE_FILTERS, strides=cfg.NUM_STRIDES, dropout=cfg.DROPOUT).to(
         device
@@ -164,6 +159,11 @@ def main():
 
                 model.eval()
                 with torch.no_grad():
+                    probe_local = sample_probe_indices(val_ds.labels, cfg.BATCH, probe_rng)
+                    vb = val_ds.__getitems__(probe_local)
+                    vcoords, vfeats, vy = collate(vb)
+                    vprobe_x = ME.SparseTensor(vfeats, vcoords, device=device)
+                    vprobe_y = vy.to(device, non_blocking=True)
                     vlogits = model(vprobe_x)
                     vloss = loss_fn(vlogits, vprobe_y)
                 model.train()
