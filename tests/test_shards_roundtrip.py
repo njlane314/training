@@ -9,7 +9,14 @@ from likelihood.data import ShardDataset, pack_events
 
 
 class TestShardsRoundTrip(unittest.TestCase):
+    """
+    @brief Unit tests for shard dataset round-trip behaviour.
+    """
+
     def test_dataset_reads(self):
+        """
+        @brief Ensure shard dataset reads stored events correctly.
+        """
         with tempfile.TemporaryDirectory() as d:
             labels = torch.tensor([0, 1, 0, 1], dtype=torch.uint8)
             meta = {"H": 4, "W": 4, "shard_events": 4, "n_events": 4, "labels": labels}

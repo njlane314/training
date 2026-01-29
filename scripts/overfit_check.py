@@ -15,6 +15,9 @@ from likelihood.model import MinkUNetClassifier
 
 
 def main():
+    """
+    @brief Run a quick overfit check on a small subset.
+    """
     meta = torch.load(os.path.join(cfg.SHARDS_DIR, "index.pt"), map_location="cpu")
     labels = np.asarray(meta["labels"], dtype=np.uint8)
     sig = np.where(labels == 1)[0]
