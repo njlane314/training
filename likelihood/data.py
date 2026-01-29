@@ -403,20 +403,20 @@ def collate(batch):
     """
     @brief Collate sparse event tuples into MinkowskiEngine inputs and targets.
     """
-    import MinkowskiEngine as ME
-
     coords_list = []
     feats_list = []
-    for c, f, _ in batch:
+    for i, (c, f, _) in enumerate(batch):
+        c = torch.as_tensor(c)
+        f = torch.as_tensor(f, dtype=torch.float32)
         if c.shape[1] == 2:
-            if isinstance(c, np.ndarray):
-                z = np.zeros((c.shape[0], 1), dtype=c.dtype)
-                c = np.concatenate([z, c], axis=1)
-            else:
-                z = torch.zeros((c.shape[0], 1), dtype=c.dtype)
-                c = torch.cat([z, c], dim=1)
-        coords_list.append(c)
+            z = torch.zeros((c.shape[0], 1), dtype=c.dtype)
+            c = torch.cat([z, c], dim=1)
+        elif c.shape[1] == 4:
+            c = c[:, 1:]
+        batch_col = torch.full((c.shape[0], 1), i, dtype=c.dtype)
+        coords_list.append(torch.cat([batch_col, c], dim=1))
         feats_list.append(f)
-    coords, feats = ME.utils.sparse_collate(coords_list, feats_list)
+    coords = torch.cat(coords_list, dim=0)
+    feats = torch.cat(feats_list, dim=0)
     y = torch.tensor([b[2] for b in batch], dtype=torch.float32)
     return coords, feats, y
