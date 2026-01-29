@@ -88,6 +88,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    env_lr = os.environ.get("LR")
+    print(f"Using LR={cfg.LR} (env LR={env_lr})", flush=True)
+
     meta = torch.load(os.path.join(cfg.SHARDS_DIR, "index.pt"), map_location="cpu")
     labels_all = np.asarray(meta["labels"], dtype=np.uint8)
 
