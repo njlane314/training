@@ -96,7 +96,7 @@ def write_shards_from_root():
     if os.path.exists(idx_path):
         os.remove(idx_path)
 
-    def render_progress(processed, total, width=32):
+    def render_progress(processed, total, width=32, stage="processing"):
         """
         @brief Render a simple progress bar to stdout.
         """
@@ -105,7 +105,7 @@ def write_shards_from_root():
         ratio = min(max(processed / total, 0.0), 1.0)
         filled = int(width * ratio)
         bar = "=" * filled + "-" * (width - filled)
-        msg = f"\rProcessing events [{bar}] {processed}/{total} ({ratio:.1%})"
+        msg = f"\r{stage.title()} events [{bar}] {processed}/{total} ({ratio:.1%})"
         print(msg, end="", file=sys.stdout, flush=True)
 
     with uproot.open(cfg.ROOT_FILE) as f:
@@ -124,6 +124,7 @@ def write_shards_from_root():
 
         for start in range(0, n_events, cfg.CHUNK_EVENTS):
             stop = min(start + cfg.CHUNK_EVENTS, n_events)
+            render_progress(start, n_events, stage="loading")
             a = t.arrays([BR_U, BR_V, BR_W], entry_start=start, entry_stop=stop, library="np")
             uu = a[BR_U]
             vv = a[BR_V]
@@ -156,7 +157,7 @@ def write_shards_from_root():
                     coords_list.clear()
                     feats_list.clear()
                     y_local.clear()
-            render_progress(stop, n_events)
+            render_progress(stop, n_events, stage="processing")
 
         if y_local:
             coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
