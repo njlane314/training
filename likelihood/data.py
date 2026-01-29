@@ -1,3 +1,4 @@
+import concurrent.futures as cf
 import faulthandler
 import glob
 import os
@@ -5,6 +6,7 @@ import signal
 import sys
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -23,21 +25,25 @@ def plane_to_sparse(flat, view, H, W, thr, signlog):
     """
     @brief Transform a flattened plane into sparse coordinates with per-hit features.
     """
-    flat = np.asarray(flat, dtype=np.float32).reshape(-1)
+    flat = np.asarray(flat).reshape(-1)
     if flat.size != H * W:
         raise ValueError(f"plane size {flat.size} != {H}*{W}")
 
     if signlog:
-        idx = np.flatnonzero(flat if thr <= 0.0 else (np.abs(flat) > thr))
-        val = flat[idx]
+        if thr <= 0.0:
+            idx = np.flatnonzero(flat)
+        else:
+            idx = np.flatnonzero(np.abs(flat) > thr)
+        if idx.size == 0:
+            return None, None
+        val = flat[idx].astype(np.float32, copy=False)
         adc = np.sign(val) * np.log1p(np.abs(val))
     else:
         idx = np.flatnonzero(flat > thr)
-        val = flat[idx]
+        if idx.size == 0:
+            return None, None
+        val = flat[idx].astype(np.float32, copy=False)
         adc = np.log1p(np.maximum(val, 0.0))
-
-    if idx.size == 0:
-        return None, None
 
     y, x = np.divmod(idx.astype(np.int64, copy=False), W)
     y_norm = (y.astype(np.float32, copy=False) - (H / 2.0)) / (H / 2.0)
@@ -99,7 +105,6 @@ def write_shards_from_root():
     if os.path.exists(idx_path):
         os.remove(idx_path)
 
-    faulthandler.dump_traceback_later(300, repeat=True)
     faulthandler.register(signal.SIGUSR1)
 
     last_msg_len = 0
@@ -129,109 +134,122 @@ def write_shards_from_root():
         print(f"\r\033[2K{msg}{padding}", end="", file=sys.stdout, flush=True)
         last_msg_len = len(msg)
 
-    with uproot.open(cfg.ROOT_FILE) as f:
-        t = f[cfg.TREE]
-        labels = t[BR_Y].array(library="np").astype(np.uint8).reshape(-1)
-        weights = t[BR_WGT].array(library="np").astype(np.float32).reshape(-1)
-        n_events = int(labels.shape[0])
+    n_decomp = int(os.environ.get("UPROOT_DECOMP_WORKERS", "2"))
+    decomp_context = cf.ThreadPoolExecutor(max_workers=n_decomp) if n_decomp > 0 else nullcontext()
 
-        nnz = np.zeros(n_events, dtype=np.int32)
+    with decomp_context as decomp:
+        with uproot.open(
+            cfg.ROOT_FILE,
+            object_cache=None,
+            array_cache=None,
+            decompression_executor=decomp if n_decomp > 0 else None,
+        ) as f:
+            t = f[cfg.TREE]
+            labels = t[BR_Y].array(library="np").astype(np.uint8).reshape(-1)
+            weights = t[BR_WGT].array(library="np").astype(np.float32).reshape(-1)
+            n_events = int(labels.shape[0])
 
-        shard_id = 0
-        shard_start = 0
-        coords_list = []
-        feats_list = []
-        y_local = []
+            nnz = np.zeros(n_events, dtype=np.int32)
 
-        for start in range(0, n_events, cfg.CHUNK_EVENTS):
-            stop = min(start + cfg.CHUNK_EVENTS, n_events)
-            render_progress(start, n_events, stage="loading")
-            t0 = time.perf_counter()
-            a = t.arrays([BR_U, BR_V, BR_W], entry_start=start, entry_stop=stop, library="np")
-            t1 = time.perf_counter()
-            uu = a[BR_U]
-            vv = a[BR_V]
-            ww = a[BR_W]
-            max_nnz_in_chunk = 0
+            shard_id = 0
+            shard_start = 0
+            coords_list = []
+            feats_list = []
+            y_local = []
 
-            for j in range(stop - start):
-                gi = start + j
-                c, fe = event_to_sparse(uu[j], vv[j], ww[j], cfg.H, cfg.W, cfg.THRESH, cfg.ADC_SIGNLOG)
-                max_nnz_in_chunk = max(max_nnz_in_chunk, int(c.shape[0]))
-                nnz[gi] = int(c.shape[0])
-                coords_list.append(c)
-                feats_list.append(fe)
-                y_local.append(int(labels[gi]))
+            for start in range(0, n_events, cfg.CHUNK_EVENTS):
+                stop = min(start + cfg.CHUNK_EVENTS, n_events)
+                render_progress(start, n_events, stage="loading")
+                faulthandler.dump_traceback_later(120, repeat=False)
+                try:
+                    t0 = time.perf_counter()
+                    a = t.arrays([BR_U, BR_V, BR_W], entry_start=start, entry_stop=stop, library="np")
+                    t1 = time.perf_counter()
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
+                uu = a[BR_U]
+                vv = a[BR_V]
+                ww = a[BR_W]
+                max_nnz_in_chunk = 0
 
-                if len(y_local) == cfg.SHARD_EVENTS:
-                    t2 = time.perf_counter()
-                    coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
-                    t3 = time.perf_counter()
-                    shard_path = os.path.join(out_dir, f"shard_{shard_id:05d}.pt")
-                    torch.save(
-                        {
-                            "start_event": int(shard_start),
-                            "n_events": int(len(y_local)),
-                            "coords": coords_t,
-                            "feats": feats_t,
-                            "starts": starts_t,
-                            "labels": torch.tensor(y_local, dtype=torch.uint8),
-                        },
-                        shard_path,
-                    )
-                    t4 = time.perf_counter()
-                    print(
-                        f"\nshard {shard_id:05d} @event {gi} "
-                        f"read_chunk={t1 - t0:.3f}s pack={t3 - t2:.3f}s save={t4 - t3:.3f}s",
-                        flush=True,
-                    )
-                    shard_id += 1
-                    shard_start = gi + 1
-                    coords_list.clear()
-                    feats_list.clear()
-                    y_local.clear()
-            t5 = time.perf_counter()
-            print(
-                f"\nchunk {start}:{stop} read={t1 - t0:.3f}s proc={t5 - t1:.3f}s "
-                f"max_nnz={max_nnz_in_chunk}",
-                flush=True,
-            )
-            render_progress(stop, n_events)
+                for j in range(stop - start):
+                    gi = start + j
+                    c, fe = event_to_sparse(uu[j], vv[j], ww[j], cfg.H, cfg.W, cfg.THRESH, cfg.ADC_SIGNLOG)
+                    max_nnz_in_chunk = max(max_nnz_in_chunk, int(c.shape[0]))
+                    nnz[gi] = int(c.shape[0])
+                    coords_list.append(c)
+                    feats_list.append(fe)
+                    y_local.append(int(labels[gi]))
 
-        if y_local:
-            coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
-            shard_path = os.path.join(out_dir, f"shard_{shard_id:05d}.pt")
+                    if len(y_local) == cfg.SHARD_EVENTS:
+                        t2 = time.perf_counter()
+                        coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
+                        t3 = time.perf_counter()
+                        shard_path = os.path.join(out_dir, f"shard_{shard_id:05d}.pt")
+                        torch.save(
+                            {
+                                "start_event": int(shard_start),
+                                "n_events": int(len(y_local)),
+                                "coords": coords_t,
+                                "feats": feats_t,
+                                "starts": starts_t,
+                                "labels": torch.tensor(y_local, dtype=torch.uint8),
+                            },
+                            shard_path,
+                        )
+                        t4 = time.perf_counter()
+                        print(
+                            f"\nshard {shard_id:05d} @event {gi} "
+                            f"read_chunk={t1 - t0:.3f}s pack={t3 - t2:.3f}s save={t4 - t3:.3f}s",
+                            flush=True,
+                        )
+                        shard_id += 1
+                        shard_start = gi + 1
+                        coords_list.clear()
+                        feats_list.clear()
+                        y_local.clear()
+                t5 = time.perf_counter()
+                print(
+                    f"\nchunk {start}:{stop} read={t1 - t0:.3f}s proc={t5 - t1:.3f}s "
+                    f"max_nnz={max_nnz_in_chunk}",
+                    flush=True,
+                )
+                render_progress(stop, n_events)
+
+            if y_local:
+                coords_t, feats_t, starts_t = pack_events(coords_list, feats_list, feat_dtype=np.float16)
+                shard_path = os.path.join(out_dir, f"shard_{shard_id:05d}.pt")
+                torch.save(
+                    {
+                        "start_event": int(shard_start),
+                        "n_events": int(len(y_local)),
+                        "coords": coords_t,
+                        "feats": feats_t,
+                        "starts": starts_t,
+                        "labels": torch.tensor(y_local, dtype=torch.uint8),
+                    },
+                    shard_path,
+                )
+                shard_id += 1
+
+            if n_events:
+                print(file=sys.stdout, flush=True)
+
             torch.save(
                 {
-                    "start_event": int(shard_start),
-                    "n_events": int(len(y_local)),
-                    "coords": coords_t,
-                    "feats": feats_t,
-                    "starts": starts_t,
-                    "labels": torch.tensor(y_local, dtype=torch.uint8),
+                    "H": int(cfg.H),
+                    "W": int(cfg.W),
+                    "shard_events": int(cfg.SHARD_EVENTS),
+                    "n_events": int(n_events),
+                    "labels": torch.from_numpy(labels),
+                    "weights": torch.from_numpy(weights),
+                    "nnz": torch.from_numpy(nnz),
+                    "branches": {"y": BR_Y, "u": BR_U, "v": BR_V, "w": BR_W, "wgt": BR_WGT},
                 },
-                shard_path,
+                idx_path,
             )
-            shard_id += 1
 
-    if n_events:
-        print(file=sys.stdout, flush=True)
-
-    torch.save(
-        {
-            "H": int(cfg.H),
-            "W": int(cfg.W),
-            "shard_events": int(cfg.SHARD_EVENTS),
-            "n_events": int(n_events),
-            "labels": torch.from_numpy(labels),
-            "weights": torch.from_numpy(weights),
-            "nnz": torch.from_numpy(nnz),
-            "branches": {"y": BR_Y, "u": BR_U, "v": BR_V, "w": BR_W, "wgt": BR_WGT},
-        },
-        idx_path,
-    )
-
-    print(f"wrote {shard_id} shards to {out_dir} (events={n_events})", flush=True)
+            print(f"wrote {shard_id} shards to {out_dir} (events={n_events})", flush=True)
 
 
 class ShardDataset(torch.utils.data.Dataset):
