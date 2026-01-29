@@ -34,6 +34,7 @@ EMA = _env("EMA", 0.98, float)
 GRAD_CLIP = _env("GRAD_CLIP", 1.0, float)
 VAL_FRAC = _env("VAL_FRAC", 0.1, float)
 OUT = os.environ.get("OUT", "checkpoint.pt")
+LOG_OUT = os.environ.get("LOG_OUT", "training_metrics.log")
 
 BASE_FILTERS = _env("BASE_FILTERS", 32, int)
 NUM_STRIDES = _env("NUM_STRIDES", 4, int)
