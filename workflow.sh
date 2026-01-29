@@ -5,11 +5,17 @@ conda activate /gluster/data/dune/niclane/miniforge/envs/hep-sparse-env
 python -c "import torch; print(torch.cuda.is_available())"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-ROOT="/gluster/data/dune/niclane/events.root"
+
+export SHARDS_DIR="${SHARDS_DIR:-/gluster/data/dune/niclane/sparse_shards}"
+export OUT="${OUT:-checkpoint.pt}"
+
 if [[ -n "${SLURM_TMPDIR:-}" ]]; then
-  cp -u "${ROOT}" "${SLURM_TMPDIR}/events.root"
-  ROOT="${SLURM_TMPDIR}/events.root"
+  LOCAL="${SLURM_TMPDIR}/$(basename "${SHARDS_DIR}")"
+  if [[ ! -d "${LOCAL}" ]]; then
+    mkdir -p "${LOCAL}"
+    rsync -a "${SHARDS_DIR}/" "${LOCAL}/"
+  fi
+  export SHARDS_DIR="${LOCAL}"
 fi
-export ROOT_FILE="${ROOT}"
-export OUT="checkpoint.pt"
+
 python train.py
