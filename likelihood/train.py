@@ -1,3 +1,4 @@
+import csv
 import os
 import random
 import time
@@ -131,56 +132,77 @@ def main():
     ema_v = None
     step0 = 0
 
-    for epoch in range(cfg.EPOCHS):
-        trn_bs.set_epoch(epoch)
-        model.train()
-        for i, (coords, feats, y) in enumerate(trn_loader):
-            x = ME.SparseTensor(feats, coords, device=device)
-            y = y.to(device, non_blocking=True)
+    log_handle = None
+    log_writer = None
+    if cfg.LOG_OUT:
+        needs_header = True
+        if os.path.exists(cfg.LOG_OUT) and os.path.getsize(cfg.LOG_OUT) > 0:
+            needs_header = False
+        log_handle = open(cfg.LOG_OUT, "a", buffering=1, encoding="utf-8", newline="")
+        log_writer = csv.writer(log_handle)
+        if needs_header:
+            log_writer.writerow(
+                ["epoch", "step", "lr", "train", "val", "ema_train", "ema_val", "acc", "vacc"]
+            )
 
-            opt.zero_grad(set_to_none=True)
-            logits = model(x)
-            tloss = loss_fn(logits, y)
-            tloss.backward()
-            if cfg.GRAD_CLIP > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-            opt.step()
-            sched.step()
-
-            model.eval()
-            with torch.no_grad():
-                vlogits = model(vprobe_x)
-                vloss = loss_fn(vlogits, vprobe_y)
+    try:
+        for epoch in range(cfg.EPOCHS):
+            trn_bs.set_epoch(epoch)
             model.train()
+            for i, (coords, feats, y) in enumerate(trn_loader):
+                x = ME.SparseTensor(feats, coords, device=device)
+                y = y.to(device, non_blocking=True)
 
-            tl = float(tloss.item())
-            vl = float(vloss.item())
-            ema_t = tl if ema_t is None else (cfg.EMA * ema_t + (1.0 - cfg.EMA) * tl)
-            ema_v = vl if ema_v is None else (cfg.EMA * ema_v + (1.0 - cfg.EMA) * vl)
+                opt.zero_grad(set_to_none=True)
+                logits = model(x)
+                tloss = loss_fn(logits, y)
+                tloss.backward()
+                if cfg.GRAD_CLIP > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                opt.step()
+                sched.step()
 
-            tacc = (logits > 0).eq(y > 0.5).float().mean().item()
-            vacc = (vlogits > 0).eq(vprobe_y > 0.5).float().mean().item()
-            lr = opt.param_groups[0]["lr"]
-            step = step0 + i + 1
-            print(
-                f"{epoch+1:03d} {step:07d} lr={lr:.2e} train={tl:.6f} val={vl:.6f} "
-                f"ema={ema_t:.6f}/{ema_v:.6f} acc={tacc:.3f} vacc={vacc:.3f}",
-                flush=True,
-            )
+                model.eval()
+                with torch.no_grad():
+                    vlogits = model(vprobe_x)
+                    vloss = loss_fn(vlogits, vprobe_y)
+                model.train()
 
-        step0 += len(trn_loader)
-        if ema_v is not None and ema_v < best:
-            best = float(ema_v)
-            torch.save(
-                {
-                    "epoch": int(epoch + 1),
-                    "step": int(step0),
-                    "model": model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "best_ema_val": best,
-                    "cfg": {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()},
-                },
-                cfg.OUT,
-            )
+                tl = float(tloss.item())
+                vl = float(vloss.item())
+                ema_t = tl if ema_t is None else (cfg.EMA * ema_t + (1.0 - cfg.EMA) * tl)
+                ema_v = vl if ema_v is None else (cfg.EMA * ema_v + (1.0 - cfg.EMA) * vl)
 
-    torch.save({"epoch": int(cfg.EPOCHS), "step": int(step0), "model": model.state_dict()}, cfg.OUT)
+                tacc = (logits > 0).eq(y > 0.5).float().mean().item()
+                vacc = (vlogits > 0).eq(vprobe_y > 0.5).float().mean().item()
+                lr = opt.param_groups[0]["lr"]
+                step = step0 + i + 1
+                line = (
+                    f"{epoch+1:03d} {step:07d} lr={lr:.2e} train={tl:.6f} val={vl:.6f} "
+                    f"ema={ema_t:.6f}/{ema_v:.6f} acc={tacc:.3f} vacc={vacc:.3f}"
+                )
+                print(line, flush=True)
+                if log_writer is not None:
+                    log_writer.writerow(
+                        [epoch + 1, step, lr, tl, vl, ema_t, ema_v, tacc, vacc]
+                    )
+
+            step0 += len(trn_loader)
+            if ema_v is not None and ema_v < best:
+                best = float(ema_v)
+                torch.save(
+                    {
+                        "epoch": int(epoch + 1),
+                        "step": int(step0),
+                        "model": model.state_dict(),
+                        "opt": opt.state_dict(),
+                        "best_ema_val": best,
+                        "cfg": {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()},
+                    },
+                    cfg.OUT,
+                )
+
+        torch.save({"epoch": int(cfg.EPOCHS), "step": int(step0), "model": model.state_dict()}, cfg.OUT)
+    finally:
+        if log_handle is not None:
+            log_handle.close()
