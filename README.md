@@ -89,6 +89,121 @@ Training (`likelihood/train.py`) uses:
 - **Validation:** a random probe batch from the validation set each step to track EMA of loss.
 - **Checkpoint:** best EMA validation loss (`checkpoint.pt` by default).
 
+## Troubleshooting: training stuck near chance
+
+If loss stays near ~0.693 and accuracy near ~50%, use the checks below to isolate data, label, or optimization issues quickly.
+
+### 1) Verify sparsification isn’t collapsing inputs
+
+If most events are empty, training degenerates to a constant bias. Use the stored `index.pt` metadata to spot this:
+
+```python
+import os, numpy as np, torch
+import likelihood.config as cfg
+
+meta = torch.load(os.path.join(cfg.SHARDS_DIR, "index.pt"), map_location="cpu")
+labels = np.asarray(meta["labels"], dtype=np.uint8)
+nnz = np.asarray(meta["nnz"], dtype=np.int32)
+
+print("n_events:", len(labels))
+print("class counts:", np.bincount(labels))
+print("placeholder frac (nnz==1):", np.mean(nnz == 1))
+
+for cls in [0, 1]:
+    m = (labels == cls)
+    q = np.quantile(nnz[m], [0, 0.5, 0.9, 0.99, 1.0])
+    print(f"class {cls} nnz quantiles:", q)
+```
+
+If the placeholder fraction is large, reduce `THRESH` or enable signed log ADC (`ADC_SIGNLOG=1`) so negative hits are retained.
+
+### 2) Check feature dynamic range in a batch
+
+```python
+import torch
+import likelihood.config as cfg
+
+coords, feats, y = next(iter(trn_loader))
+nnz_per_evt = torch.bincount(coords[:, 0], minlength=cfg.BATCH).cpu()
+
+print("batch y mean:", float(y.mean()))
+print("nnz/event: min/med/max:", int(nnz_per_evt.min()), float(nnz_per_evt.median()), int(nnz_per_evt.max()))
+print("frac nnz==1 in batch:", float((nnz_per_evt == 1).float().mean()))
+print("ADC feat: min/mean/max:", float(feats[:, 0].min()), float(feats[:, 0].mean()), float(feats[:, 0].max()))
+print("feat std (all channels):", [float(feats[:, k].std(unbiased=False)) for k in range(feats.shape[1])])
+```
+
+If `feats[:, 0]` is nearly constant or zero, the model cannot learn.
+
+### 3) Confirm index/shard label alignment
+
+If `index.pt` and shard labels are out of sync, the sampler will feed random labels:
+
+```python
+import os, numpy as np, torch
+import likelihood.config as cfg
+
+meta = torch.load(os.path.join(cfg.SHARDS_DIR, "index.pt"), map_location="cpu")
+labels_all = np.asarray(meta["labels"], dtype=np.uint8)
+shard_events = int(meta["shard_events"])
+
+rng = np.random.default_rng(0)
+for _ in range(20):
+    gi = int(rng.integers(0, len(labels_all)))
+    sid = gi // shard_events
+    local = gi - sid * shard_events
+    d = torch.load(os.path.join(cfg.SHARDS_DIR, f"shard_{sid:05d}.pt"), map_location="cpu")
+    y_shard = int(d["labels"][local].item())
+    y_idx = int(labels_all[gi])
+    if y_shard != y_idx:
+        print("MISMATCH!", gi, sid, local, y_idx, y_shard)
+        break
+else:
+    print("OK: shard labels match index labels on samples")
+```
+
+If there is a mismatch, rebuild shards and `index.pt` together.
+
+### 4) Prove weights update
+
+Inside the first train step, verify that parameters change:
+
+```python
+if epoch == 0 and i == 0:
+    with torch.no_grad():
+        w_before = model.head[-1].weight.detach().clone()
+
+logits = model(x).view(-1)
+tloss = loss_fn(logits, y)
+tloss.backward()
+
+if micro_step % accum == 0:
+    opt.step()
+
+if epoch == 0 and i == 0:
+    with torch.no_grad():
+        w_after = model.head[-1].weight.detach()
+        dmax = float((w_after - w_before).abs().max().item())
+    print("head last layer |Δw|_max after 1 step:", dmax)
+```
+
+`dmax == 0.0` indicates the optimizer never applied an update (check LR, grad accumulation, or step execution).
+
+### 5) Overfit a tiny fixed subset
+
+If the model cannot overfit 64 fixed events, there is a bug in data or gradients. Use `scripts/overfit_check.py` or create a tiny fixed batch and iterate on it for a few hundred steps with dropout and weight decay disabled.
+
+### 6) DataLoader sanity checks
+
+- Ensure batch balance: `print("batch y mean:", float(y.mean()))` should be ~0.5 with the balanced sampler.
+- If behavior changes with `NUM_WORKERS=0`, you may have worker corruption or stale caches.
+
+### 7) Architecture-specific checks
+
+- Monitor active sites (`x.C.shape[0]`) through the network if using stride-1 `MinkowskiConvolution`; switch to submanifold convs if nnz explodes.
+- Global sum pooling scales with nnz; try average pooling or divide by count if scale varies widely.
+- Check placeholder imbalance across classes (nnz==1 fraction) so the model doesn’t learn “empty” shortcuts.
+
 ## Configuration (environment variables)
 
 `likelihood/config.py` reads all configuration from environment variables. Key settings include:
