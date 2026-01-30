@@ -90,6 +90,7 @@ class MinkUNetClassifier(nn.Module):
         self.inorm = InputNorm(in_channels)
         self.c0 = ME.MinkowskiConvolution(in_channels, base, kernel_size=KS, dimension=3)
         self.view_mix = ME.MinkowskiConvolution(base, base, kernel_size=KS_VIEW_MIX, dimension=3)
+        self.view_mix.kernel_size = KS_VIEW_MIX
 
         self.enc = nn.ModuleList()
         ch = base
