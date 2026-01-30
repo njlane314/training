@@ -174,7 +174,15 @@ def write_shards_from_root():
 
                 for j in range(stop - start):
                     gi = start + j
-                    c, fe = event_to_sparse(uu[j], vv[j], ww[j], cfg.H, cfg.W, cfg.THRESH, cfg.ADC_SIGNLOG)
+                    c, fe = event_to_sparse(
+                        uu[j],
+                        vv[j],
+                        ww[j],
+                        cfg.H,
+                        cfg.W,
+                        cfg.THRESH,
+                        cfg.ADC_SIGNLOG,
+                    )
                     max_nnz_in_chunk = max(max_nnz_in_chunk, int(c.shape[0]))
                     nnz[gi] = int(c.shape[0])
                     coords_list.append(c)

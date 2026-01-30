@@ -30,7 +30,7 @@ If you need a full workflow script with environment variables, see [`workflow_up
 ### 1) Dense planes → sparse points
 Each event provides three 2D planes (`detector_image_u`, `detector_image_v`, `detector_image_w`). For every plane:
 
-- Flatten `(H, W)` into `flat`.
+- Flatten `(H, W)` into `flat`, with **drift along the y-axis (rows)** and **wire along the x-axis (columns)**.
 - Threshold and transform ADC values into a sparse set of points.
 
 Two ADC encodings are supported (controlled by `ADC_SIGNLOG`):
