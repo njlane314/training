@@ -39,15 +39,16 @@ class TestWriteShardsFromRootSubprocess(unittest.TestCase):
             labels = np.array([0, 1, 0, 1, 0, 1], dtype=np.uint8)
             weights = np.ones(n, dtype=np.float32)
 
+            array_dtype = np.dtype((np.float32, H * W))
             with uproot.recreate(root_path) as f:
                 f.mktree(
                     "events",
                     {
                         "is_signal": "uint8",
                         "w_nominal": "float32",
-                        "detector_image_u": f"float32[{H * W}]",
-                        "detector_image_v": f"float32[{H * W}]",
-                        "detector_image_w": f"float32[{H * W}]",
+                        "detector_image_u": array_dtype,
+                        "detector_image_v": array_dtype,
+                        "detector_image_w": array_dtype,
                     },
                 )
                 f["events"].extend(

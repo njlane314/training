@@ -5,6 +5,7 @@ import MinkowskiEngine as ME
 
 # Allow cross-view convolution (mix U/V/W through the "view" coordinate axis)
 KS = (3, 3, 3)
+KS_VIEW_MIX = (3, 1, 1)
 DS = (1, 2, 2)
 
 
@@ -88,6 +89,7 @@ class MinkUNetClassifier(nn.Module):
         super().__init__()
         self.inorm = InputNorm(in_channels)
         self.c0 = ME.MinkowskiConvolution(in_channels, base, kernel_size=KS, dimension=3)
+        self.view_mix = ME.MinkowskiConvolution(base, base, kernel_size=KS_VIEW_MIX, dimension=3)
 
         self.enc = nn.ModuleList()
         ch = base
@@ -128,6 +130,7 @@ class MinkUNetClassifier(nn.Module):
 
         x = self.inorm(x)
         x = self.c0(x)
+        x = self.view_mix(x)
         skips = []
         for i in range(0, len(self.enc), 2):
             x = self.enc[i](x)
