@@ -142,8 +142,12 @@ class MinkUNetClassifier(nn.Module):
             x = self.dec[i + 1](x)
 
         x = self.drop(self.bn(x))
-        p_sum = self.p_sum(x)
-        p_max = self.p_max(x)
+        if torch.all(cnt == 1):
+            p_sum = x
+            p_max = x
+        else:
+            p_sum = self.p_sum(x)
+            p_max = self.p_max(x)
         s = p_sum.F
         m = p_max.F
         z = torch.cat([s, m], dim=1)
