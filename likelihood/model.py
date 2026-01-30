@@ -150,8 +150,13 @@ class MinkUNetClassifier(nn.Module):
             p_max = self.p_max(x)
         s = p_sum.F
         m = p_max.F
-        z = torch.cat([s, m], dim=1)
         out_batch_ids = p_sum.C[:, 0].to(dtype=torch.int64)
+        if out_batch_ids.numel() > 1:
+            order = torch.argsort(out_batch_ids)
+            s = s[order]
+            m = m[order]
+            out_batch_ids = out_batch_ids[order]
+        z = torch.cat([s, m], dim=1)
         pos = torch.searchsorted(uniq, out_batch_ids)
         log_cnt = torch.log1p(cnt[pos].to(dtype=torch.float32))
         z = torch.cat([z, log_cnt.to(z.device, non_blocking=True).view(-1, 1)], dim=1)
