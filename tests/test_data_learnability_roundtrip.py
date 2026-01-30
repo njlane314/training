@@ -59,14 +59,15 @@ def make_synthetic_root(root_path, *, n_events=32, H=16, W=16, hits_per_view=8, 
             plane[i, idx] = amp
 
     with uproot.recreate(root_path) as f:
+        arr_dtype = np.dtype((np.float32, H * W))
         f.mktree(
             "events",
             {
                 "is_signal": "uint8",
                 "w_nominal": "float32",
-                "detector_image_u": f"float32[{H * W}]",
-                "detector_image_v": f"float32[{H * W}]",
-                "detector_image_w": f"float32[{H * W}]",
+                "detector_image_u": arr_dtype,
+                "detector_image_v": arr_dtype,
+                "detector_image_w": arr_dtype,
             },
         )
         f["events"].extend(
