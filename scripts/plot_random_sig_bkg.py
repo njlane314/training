@@ -194,7 +194,6 @@ def main():
     ap.add_argument("--br-u", default=os.environ.get("BR_U", "detector_image_u"))
     ap.add_argument("--br-v", default=os.environ.get("BR_V", "detector_image_v"))
     ap.add_argument("--br-w", default=os.environ.get("BR_W", "detector_image_w"))
-
     # Transform settings for ROOT-mode visualization (match your sparsifier)
     ap.add_argument("--thr", type=float, default=float(os.environ.get("THRESH", "0.0")))
     ap.add_argument("--signlog", action="store_true", default=(os.environ.get("ADC_SIGNLOG", "0") != "0"))
