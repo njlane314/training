@@ -264,9 +264,17 @@ def main():
                         p_sd = float(p.std(unbiased=False).item())
                         dw0 = float((model.head[0].weight.detach() - w_head0_0).abs().mean().item())
                         dw1 = float((model.head[-1].weight.detach() - w_head1_0).abs().mean().item())
+                        g0 = model.head[0].weight.grad
+                        g1 = model.head[-1].weight.grad
+                        g0_mean = float(g0.mean().item()) if g0 is not None else float("nan")
+                        g1_mean = float(g1.mean().item()) if g1 is not None else float("nan")
+                        g0_abs = float(g0.abs().mean().item()) if g0 is not None else float("nan")
+                        g1_abs = float(g1.abs().mean().item()) if g1 is not None else float("nan")
                     print(
                         f"    logits μ/σ={l_mu:+.3e}/{l_sd:.3e}  p μ/σ={p_mu:.3f}/{p_sd:.3f}  "
-                        f"ΔW_head0={dw0:.3e}  ΔW_head1={dw1:.3e}",
+                        f"ΔW_head0={dw0:.3e}  ΔW_head1={dw1:.3e}  "
+                        f"g_head0 μ/|μ|={g0_mean:+.3e}/{g0_abs:.3e}  "
+                        f"g_head1 μ/|μ|={g1_mean:+.3e}/{g1_abs:.3e}",
                         flush=True,
                     )
                 if log_writer is not None:
