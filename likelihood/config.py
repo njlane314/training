@@ -36,6 +36,9 @@ GRAD_CLIP = _env("GRAD_CLIP", 1.0, float)
 GRAD_ACCUM_STEPS = _env("GRAD_ACCUM_STEPS", 1, int)
 WARMUP_RATIO = _env("WARMUP_RATIO", 0.02, float)
 MIN_LR_RATIO = _env("MIN_LR_RATIO", 0.05, float)
+SCHED = _env("SCHED", 0, int) != 0
+AMP = _env("AMP", 0, int) != 0
+VAL_PROBE_EVERY = _env("VAL_PROBE_EVERY", 1, int)
 VAL_FRAC = _env("VAL_FRAC", 0.1, float)
 OUT = os.environ.get("OUT", "checkpoint.pt")
 LOG_OUT = os.environ.get("LOG_OUT", "training_metrics.log")
