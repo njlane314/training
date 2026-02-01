@@ -9,7 +9,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
-# from torch.optim.lr_scheduler import LambdaLR
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import LambdaLR
 
 import MinkowskiEngine as ME
 
@@ -110,6 +111,9 @@ def main():
         torch.cuda.manual_seed_all(cfg.SEED)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = bool(cfg.AMP and device.type == "cuda")
+    scaler = GradScaler(enabled=use_amp)
+    probe_every = max(1, int(getattr(cfg, "VAL_PROBE_EVERY", 1)))
 
     env_lr = os.environ.get("LR")
     print(f"Using LR={cfg.LR} (env LR={env_lr})", flush=True)
@@ -149,7 +153,9 @@ def main():
     model = MinkUNetClassifier(in_channels=4, base=cfg.BASE_FILTERS, strides=cfg.NUM_STRIDES, dropout=cfg.DROPOUT).to(
         device
     )
-    grad_handles = attach_grad_hooks(model)
+    grad_handles = []
+    if os.environ.get("DEBUG_GRADS", "0") != "0":
+        grad_handles = attach_grad_hooks(model)
     # Weight-movement probes (simple, robust: linear head weights are always torch.Parameters)
     w_head0_0 = model.head[0].weight.detach().clone()
     w_head1_0 = model.head[-1].weight.detach().clone()
@@ -158,13 +164,15 @@ def main():
     print("--------------------------------------------------")
     opt = optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
     accum = max(1, int(cfg.GRAD_ACCUM_STEPS))
-    # total_steps = cfg.EPOCHS * math.ceil(len(trn_loader) / accum)
-    # sched = cosine_warmup(
-    #     opt,
-    #     total_steps=total_steps,
-    #     warmup_ratio=cfg.WARMUP_RATIO,
-    #     min_lr_ratio=cfg.MIN_LR_RATIO,
-    # )
+    sched = None
+    if getattr(cfg, "SCHED", False):
+        total_steps = int(cfg.EPOCHS) * int(math.ceil(len(trn_loader) / accum))
+        sched = cosine_warmup(
+            opt,
+            total_steps=total_steps,
+            warmup_ratio=cfg.WARMUP_RATIO,
+            min_lr_ratio=cfg.MIN_LR_RATIO,
+        )
     loss_fn = nn.BCEWithLogitsLoss()
 
     t0 = time.time()
@@ -191,6 +199,8 @@ def main():
     best = float("inf")
     ema_t = None
     ema_v = None
+    last_vl = None
+    last_vacc = None
     step0 = 0
     micro_step = 0
 
@@ -217,34 +227,56 @@ def main():
 
                 if micro_step % accum == 0:
                     opt.zero_grad(set_to_none=True)
-                logits = model(x).view(-1)
-                tloss = loss_fn(logits, y)
-                tloss.backward()
+                with autocast(enabled=use_amp):
+                    logits = model(x).view(-1)
+                    tloss = loss_fn(logits, y)
+                    # If accumulating, backprop the mean gradient (keeps effective LR stable).
+                    loss_to_bp = tloss / float(accum)
+                if use_amp:
+                    scaler.scale(loss_to_bp).backward()
+                else:
+                    loss_to_bp.backward()
                 micro_step += 1
                 stepped = False
                 if micro_step % accum == 0:
-                    opt.step()
-                    # sched.step()
+                    if cfg.GRAD_CLIP and cfg.GRAD_CLIP > 0:
+                        if use_amp:
+                            scaler.unscale_(opt)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                    if use_amp:
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        opt.step()
+                    if sched is not None:
+                        sched.step()
                     stepped = True
 
-                model.eval()
-                with torch.no_grad():
-                    probe_local = sample_probe_indices(val_ds.labels, cfg.BATCH, probe_rng)
-                    vb = val_ds.__getitems__(probe_local)
-                    vcoords, vfeats, vy = collate(vb)
-                    vprobe_x = ME.SparseTensor(vfeats, vcoords, device=device)
-                    vprobe_y = vy.to(device, non_blocking=True).float().view(-1)
-                    vlogits = model(vprobe_x).view(-1)
-                    vloss = loss_fn(vlogits, vprobe_y)
-                model.train()
+                # Probe val only on optimizer steps (or first time), to reduce noise/overhead.
+                do_probe = (last_vl is None) or (stepped and (step0 % probe_every == 0))
+                if do_probe:
+                    model.eval()
+                    with torch.no_grad(), autocast(enabled=use_amp):
+                        probe_local = sample_probe_indices(val_ds.labels, cfg.BATCH, probe_rng)
+                        vb = val_ds.__getitems__(probe_local)
+                        vcoords, vfeats, vy = collate(vb)
+                        vprobe_x = ME.SparseTensor(vfeats, vcoords, device=device)
+                        vprobe_y = vy.to(device, non_blocking=True).float().view(-1)
+                        vlogits = model(vprobe_x).view(-1)
+                        vloss = loss_fn(vlogits, vprobe_y)
+                        vacc = (vlogits > 0).eq(vprobe_y > 0.5).float().mean().item()
+                    model.train()
+                    last_vl = float(vloss.item())
+                    last_vacc = float(vacc)
 
                 tl = float(tloss.item())
-                vl = float(vloss.item())
+                vl = float(last_vl) if last_vl is not None else float("nan")
                 ema_t = tl if ema_t is None else (cfg.EMA * ema_t + (1.0 - cfg.EMA) * tl)
-                ema_v = vl if ema_v is None else (cfg.EMA * ema_v + (1.0 - cfg.EMA) * vl)
+                if do_probe:
+                    ema_v = vl if ema_v is None else (cfg.EMA * ema_v + (1.0 - cfg.EMA) * vl)
 
                 tacc = (logits > 0).eq(y > 0.5).float().mean().item()
-                vacc = (vlogits > 0).eq(vprobe_y > 0.5).float().mean().item()
+                vacc = float(last_vacc) if last_vacc is not None else float("nan")
                 lr = opt.param_groups[0]["lr"]
                 if stepped:
                     step0 += 1
@@ -257,9 +289,10 @@ def main():
                 # Debug prints: logits/statistics + weight movement every 50 optimizer steps
                 if stepped and (step % 50 == 0):
                     with torch.no_grad():
-                        l_mu = float(logits.mean().item())
-                        l_sd = float(logits.std(unbiased=False).item())
-                        p = torch.sigmoid(logits)
+                        lf = logits.float()
+                        l_mu = float(lf.mean().item())
+                        l_sd = float(lf.std(unbiased=False).item())
+                        p = torch.sigmoid(lf)
                         p_mu = float(p.mean().item())
                         p_sd = float(p.std(unbiased=False).item())
                         dw0 = float((model.head[0].weight.detach() - w_head0_0).abs().mean().item())
@@ -275,8 +308,17 @@ def main():
                     )
 
             if micro_step % accum != 0:
-                opt.step()
-                # sched.step()
+                if cfg.GRAD_CLIP and cfg.GRAD_CLIP > 0:
+                    if use_amp:
+                        scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                if use_amp:
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
+                if sched is not None:
+                    sched.step()
                 step0 += 1
                 micro_step = 0
 
@@ -288,6 +330,8 @@ def main():
                         "step": int(step0),
                         "model": model.state_dict(),
                         "opt": opt.state_dict(),
+                        "sched": sched.state_dict() if sched is not None else None,
+                        "scaler": scaler.state_dict() if use_amp else None,
                         "best_ema_val": best,
                         "cfg": {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()},
                     },

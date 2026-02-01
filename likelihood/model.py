@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 
@@ -39,12 +40,17 @@ class ResidualBlock(nn.Module):
         @brief Initialise the residual block layers and optional shortcut convolution.
         """
         super().__init__()
-        self.c1 = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=KS, dimension=dim)
+        # With (Layer|Instance)Norm, conv biases are redundant and can hurt stability.
+        self.c1 = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=KS, dimension=dim, bias=False)
         self.n1 = MinkowskiLayerNorm(out_ch)
-        self.c2 = ME.MinkowskiConvolution(out_ch, out_ch, kernel_size=KS, dimension=dim)
+        self.c2 = ME.MinkowskiConvolution(out_ch, out_ch, kernel_size=KS, dimension=dim, bias=False)
         self.n2 = MinkowskiLayerNorm(out_ch)
         self.r = ME.MinkowskiReLU(inplace=True)
-        self.sc = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=1, dimension=dim) if in_ch != out_ch else None
+        self.sc = (
+            ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=1, dimension=dim, bias=False)
+            if in_ch != out_ch
+            else None
+        )
 
     def forward(self, x):
         """
@@ -88,15 +94,17 @@ class MinkUNetClassifier(nn.Module):
         """
         super().__init__()
         self.inorm = InputNorm(in_channels)
-        self.c0 = ME.MinkowskiConvolution(in_channels, base, kernel_size=KS, dimension=3)
-        self.view_mix = ME.MinkowskiConvolution(base, base, kernel_size=KS_VIEW_MIX, dimension=3)
+        self.c0 = ME.MinkowskiConvolution(in_channels, base, kernel_size=KS, dimension=3, bias=False)
+        self.view_mix = ME.MinkowskiConvolution(base, base, kernel_size=KS_VIEW_MIX, dimension=3, bias=False)
         self.view_mix.kernel_size = KS_VIEW_MIX
 
         self.enc = nn.ModuleList()
         ch = base
         for _ in range(strides):
             self.enc.append(ResidualBlock(ch, ch * 2))
-            self.enc.append(ME.MinkowskiConvolution(ch * 2, ch * 2, kernel_size=DS, stride=DS, dimension=3))
+            self.enc.append(
+                ME.MinkowskiConvolution(ch * 2, ch * 2, kernel_size=DS, stride=DS, dimension=3, bias=False)
+            )
             ch *= 2
 
         self.mid = ResidualBlock(ch, ch)
@@ -104,23 +112,39 @@ class MinkUNetClassifier(nn.Module):
         self.dec = nn.ModuleList()
         for i in range(strides):
             up = ch // 2
-            self.dec.append(ME.MinkowskiConvolutionTranspose(ch, up, kernel_size=DS, stride=DS, dimension=3))
+            self.dec.append(
+                ME.MinkowskiConvolutionTranspose(ch, up, kernel_size=DS, stride=DS, dimension=3, bias=False)
+            )
             skip = base * (2 ** (strides - i))
             self.dec.append(ResidualBlock(up + skip, up))
             ch = up
 
         self.bn = nn.Sequential(MinkowskiLayerNorm(base), ME.MinkowskiReLU(inplace=True))
         self.drop = ME.MinkowskiDropout(dropout)
-        self.p_sum = ME.MinkowskiGlobalPooling()
+        # Avg + Max pooling is typically more stable than Sum + Max when nnz varies a lot.
+        self.p_avg = ME.MinkowskiGlobalAvgPooling()
         self.p_max = ME.MinkowskiGlobalMaxPooling()
 
         h = base * 2
         self.head = nn.Sequential(
             nn.Linear(h + 1, h),
+            nn.LayerNorm(h),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(h, 1),
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (ME.MinkowskiConvolution, ME.MinkowskiConvolutionTranspose)):
+                ME.utils.kaiming_normal_(m.kernel, mode="fan_out", nonlinearity="relu")
+                if getattr(m, "bias", None) is not None and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: ME.SparseTensor) -> torch.Tensor:
         """
@@ -147,14 +171,14 @@ class MinkUNetClassifier(nn.Module):
 
         x = self.drop(self.bn(x))
         if torch.all(cnt == 1):
-            p_sum = x
+            p_avg = x
             p_max = x
         else:
-            p_sum = self.p_sum(x)
+            p_avg = self.p_avg(x)
             p_max = self.p_max(x)
-        s = p_sum.F
+        s = p_avg.F
         m = p_max.F
-        out_batch_ids = p_sum.C[:, 0].to(dtype=torch.int64)
+        out_batch_ids = p_avg.C[:, 0].to(dtype=torch.int64)
         if out_batch_ids.numel() > 1:
             order = torch.argsort(out_batch_ids)
             s = s[order]

@@ -414,17 +414,18 @@ def collate(batch):
     coords_list = []
     feats_list = []
     for i, (c, f, _) in enumerate(batch):
-        c = torch.as_tensor(c)
-        f = torch.as_tensor(f, dtype=torch.float32)
+        # ME wants int32 coords; keep them contiguous for faster kernel map building.
+        c = torch.as_tensor(c, dtype=torch.int32).contiguous()
+        f = torch.as_tensor(f, dtype=torch.float32).contiguous()
         if c.shape[1] == 2:
-            z = torch.zeros((c.shape[0], 1), dtype=c.dtype)
+            z = torch.zeros((c.shape[0], 1), dtype=torch.int32)
             c = torch.cat([z, c], dim=1)
         elif c.shape[1] == 4:
             c = c[:, 1:]
-        batch_col = torch.full((c.shape[0], 1), i, dtype=c.dtype)
-        coords_list.append(torch.cat([batch_col, c], dim=1))
+        batch_col = torch.full((c.shape[0], 1), i, dtype=torch.int32)
+        coords_list.append(torch.cat([batch_col, c], dim=1).contiguous())
         feats_list.append(f)
-    coords = torch.cat(coords_list, dim=0)
-    feats = torch.cat(feats_list, dim=0)
+    coords = torch.cat(coords_list, dim=0).contiguous()
+    feats = torch.cat(feats_list, dim=0).contiguous()
     y = torch.tensor([b[2] for b in batch], dtype=torch.float32)
     return coords, feats, y
