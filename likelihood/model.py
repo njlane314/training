@@ -2,7 +2,6 @@ import torch.nn as nn
 
 import MinkowskiEngine as ME
 
-
 class ResBlock(nn.Module):
     def __init__(self, cin, cout):
         super().__init__()
