@@ -1,3 +1,4 @@
-from .model import ResBlock, UResNetClassifier
+from .fusion import LateFusionClassifier
+from .model import ResBlock, SparseUResNetEncoderClassifier
 
-__all__ = ["ResBlock", "UResNetClassifier"]
+__all__ = ["LateFusionClassifier", "ResBlock", "SparseUResNetEncoderClassifier"]
