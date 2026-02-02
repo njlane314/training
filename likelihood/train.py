@@ -6,7 +6,7 @@ import torch.nn as nn
 import MinkowskiEngine as ME
 
 from . import config as cfg
-from .dataset import ShardDataset, InfiniteCorrectedBalancedBatchSampler, collate_me
+from .dataset import BalancedBatchSampler, ShardDataset, collate_me
 from .model import SparseUResNetEncoderClassifier
 
 
@@ -33,7 +33,7 @@ def train_llr():
     ds_train = ShardDataset(cfg.LLR_SHARDS_DIR, train_idx, cache_size=2)
     ds_val = ShardDataset(cfg.LLR_SHARDS_DIR, val_idx, cache_size=2)
 
-    batch_sampler = InfiniteCorrectedBalancedBatchSampler(
+    batch_sampler = BalancedBatchSampler(
         ds_train,
         batch_size=cfg.LLR_BATCH_SIZE,
         seed=cfg.LLR_SEED,

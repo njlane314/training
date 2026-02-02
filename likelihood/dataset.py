@@ -69,7 +69,7 @@ class ShardDataset(torch.utils.data.Dataset):
         return coords, feats, y
 
 
-class InfiniteCorrectedBalancedBatchSampler(torch.utils.data.Sampler):
+class BalancedBatchSampler(torch.utils.data.Sampler):
     """
     Infinite i.i.d. sampling:
       - pick exactly half sig, half bkg per batch
