@@ -10,27 +10,35 @@ import uproot
 
 from . import config as cfg
 
-def plane_to_sparse(flat: np.ndarray, plane: int):
-    flat = np.asarray(flat, dtype=np.float32).reshape(-1)
-    if flat.size != cfg.H * cfg.W:
-        raise ValueError(f"plane size {flat.size} != {cfg.H}*{cfg.W}")
+def plane_to_sparse(
+    flat: np.ndarray,
+    plane: int,
+    *,
+    h: int = cfg.H,
+    w: int = cfg.W,
+    thresh: float = cfg.THRESH,
+):
+    flat = np.asarray(flat, dtype=np.float32).ravel()
+    if flat.size != h * w:
+        raise ValueError(f"plane size {flat.size} != {h}*{w}")
 
-    idx = np.flatnonzero(flat > cfg.THRESH)
+    idx = np.flatnonzero(flat > thresh)
     if idx.size == 0:
         return None, None
 
     val = flat[idx]
-    y, x = np.divmod(idx.astype(np.int64), cfg.W)
+    y, x = np.divmod(idx, w)
 
     coords = np.empty((idx.size, 3), dtype=np.int32)
-    coords[:, 0] = int(plane)
+    coords[:, 0] = plane
     coords[:, 1] = y.astype(np.int32, copy=False)
     coords[:, 2] = x.astype(np.int32, copy=False)
 
     # Features: occupancy, log-charge
     feats = np.empty((idx.size, 2), dtype=np.float32)
     feats[:, 0] = 1.0
-    feats[:, 1] = np.log1p(np.maximum(val, 0.0))
+    np.maximum(val, 0.0, out=val)
+    np.log1p(val, out=feats[:, 1])
 
     return coords, feats
 
