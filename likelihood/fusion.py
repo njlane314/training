@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 BatchLike = Union[torch.Tensor, Mapping[str, torch.Tensor]]
 
-
 def _forward_one(model: nn.Module, x: BatchLike) -> torch.Tensor:
     """
     Forward helper:
@@ -30,7 +29,6 @@ def _forward_one(model: nn.Module, x: BatchLike) -> torch.Tensor:
         raise ValueError(f"Base model output must be [B, C]. Got shape {tuple(out.shape)}")
 
     return out
-
 
 class LateFusionClassifier(nn.Module):
     """
