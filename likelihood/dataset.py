@@ -1,4 +1,3 @@
-# lar_dataset.py
 from collections import OrderedDict
 
 import numpy as np
@@ -111,24 +110,6 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
             yield batch[key].tolist()
 
 
-def collate_me(batch):
-    coords_list, feats_list = [], []
-    ys = []
-
-    for bi, (c, f, y) in enumerate(batch):
-        c = torch.as_tensor(c, dtype=torch.int32).contiguous()   # (N,3): (plane,y,x)
-        f = torch.as_tensor(f, dtype=torch.float32).contiguous() # (N,3): (occ, logq, plane_id)
-        bcol = torch.full((c.shape[0], 1), bi, dtype=torch.int32)
-        coords_list.append(torch.cat([bcol, c], dim=1))
-        feats_list.append(f)
-        ys.append(y)
-
-    coords = torch.cat(coords_list, dim=0).contiguous()  # (sumN,4)
-    feats = torch.cat(feats_list, dim=0).contiguous()    # (sumN,3)
-    y = torch.tensor(ys, dtype=torch.float32)
-    return coords, feats, y
-
-
 def collate_me_fusion(batch, plane_names=("u", "v", "w")):
     coords_by_plane = {name: [] for name in plane_names}
     feats_by_plane = {name: [] for name in plane_names}
@@ -139,18 +120,20 @@ def collate_me_fusion(batch, plane_names=("u", "v", "w")):
 
     for bi, (c, f, y) in enumerate(batch):
         c = torch.as_tensor(c, dtype=torch.int32).contiguous()   # (N,3): (plane,y,x)
-        f = torch.as_tensor(f, dtype=torch.float32).contiguous() # (N,3): (occ, logq, plane_id)
+        f = torch.as_tensor(f, dtype=torch.float32).contiguous() # (N,2): (occ, logq)
         ys.append(y)
 
         for pi, name in enumerate(plane_names):
             mask = c[:, 0] == pi
-            if mask.any():
+            # Mark plane as "available" only if it contains at least one real hit
+            # (occupancy > 0). This avoids treating dummy sites as present.
+            if mask.any() and (f[mask, 0] > 0).any():
                 available_mask[bi, pi] = 1.0
                 c_plane = c[mask][:, 1:3]
-                f_plane = f[mask][:, 0:2]
+                f_plane = f[mask]
             else:
                 c_plane = torch.zeros((1, 2), dtype=torch.int32)
-                f_plane = torch.zeros((1, 2), dtype=torch.float32)
+                f_plane = torch.zeros((1, f.shape[1]), dtype=torch.float32)
 
             bcol = torch.full((c_plane.shape[0], 1), bi, dtype=torch.int32)
             coords_by_plane[name].append(torch.cat([bcol, c_plane], dim=1))

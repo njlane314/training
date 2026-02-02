@@ -1,54 +1,38 @@
-from __future__ import annotations
-
-from typing import Dict, Mapping, Optional, Union
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-BatchLike = Union[torch.Tensor, Mapping[str, torch.Tensor]]
 
-def _forward_one(model: nn.Module, x: BatchLike) -> torch.Tensor:
-    """
-    Forward helper:
-      - if x is a Tensor -> model(x)
-      - if x is a dict-like -> model(**x)
-    Must return logits shaped [B, C].
-    """
-    if isinstance(x, torch.Tensor):
-        out = model(x)
-    elif isinstance(x, Mapping):
+def _call(model: nn.Module, x: Any) -> torch.Tensor:
+    if isinstance(x, Mapping):
         out = model(**x)
     else:
-        raise TypeError(f"Unsupported input type: {type(x)}")
-
+        out = model(x)
     if not isinstance(out, torch.Tensor):
-        raise TypeError("Base model must return a torch.Tensor of logits [B, C].")
-
+        raise TypeError("Base model must return a torch.Tensor.")
+    if out.ndim == 1:
+        out = out.unsqueeze(1)
     if out.ndim != 2:
-        raise ValueError(f"Base model output must be [B, C]. Got shape {tuple(out.shape)}")
-
+        raise ValueError(f"Expected logits [B,C]. Got {tuple(out.shape)}")
     return out
+
 
 class LateFusionClassifier(nn.Module):
     """
-    Late fusion over per-modality logits.
+    Product-of-experts (PoE) fusion in logit space.
 
-    models: dict name -> nn.Module that outputs logits [B, C]
-    fusion:
-      - 'mean_logits'
-      - 'weighted_logits' (learn global weights)
-      - 'meta_mlp'        (stacking classifier over concatenated logits)
-      - 'gated_logits'    (sample-dependent weights from logits)
+    If each per-plane model is trained with balanced class prior (p(sig)=p(bkg)=0.5),
+    its output logit is an estimator of the per-plane log-likelihood ratio (LLR).
+    Under conditional independence, the fused LLR is the sum of available logits.
+
+    We include a tiny calibration head: fused = exp(log_scale) * sum_logits + bias.
     """
 
     def __init__(
         self,
         models: Dict[str, nn.Module],
-        num_classes: int,
-        fusion: str = "weighted_logits",
-        meta_hidden: int = 128,
-        dropout: float = 0.1,
+        num_classes: int = 1,
     ):
         super().__init__()
         if not models:
@@ -59,53 +43,27 @@ class LateFusionClassifier(nn.Module):
         self.M = len(self.mod_names)
         self.C = int(num_classes)
 
-        allowed = {"mean_logits", "weighted_logits", "meta_mlp", "gated_logits"}
-        if fusion not in allowed:
-            raise ValueError(f"fusion must be one of {sorted(allowed)}; got {fusion}")
-        self.fusion = fusion
-
-        # Global learned weights (for weighted_logits)
-        if fusion == "weighted_logits":
-            self.logit_weights = nn.Parameter(torch.zeros(self.M))  # softmax -> weights
-
-        # Meta-learner (for meta_mlp): input = concatenated logits => [B, M*C]
-        if fusion == "meta_mlp":
-            self.meta = nn.Sequential(
-                nn.Linear(self.M * self.C, meta_hidden),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(meta_hidden, self.C),
-            )
-
-        # Gating network (for gated_logits): weights per sample from logits => [B, M]
-        if fusion == "gated_logits":
-            self.gate = nn.Sequential(
-                nn.Linear(self.M * self.C, meta_hidden),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(meta_hidden, self.M),
-            )
+        self.log_scale = nn.Parameter(torch.zeros(()))
+        self.bias = nn.Parameter(torch.zeros(self.C))
 
     def forward(
         self,
-        inputs: Dict[str, BatchLike],
+        inputs: Dict[str, Any],
         available_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        inputs: dict modality -> tensor or dict of tensors (for models needing multiple args)
-        available_mask (optional): [B, M] boolean or {0,1} mask indicating which modalities
-          are present per sample. If None, assumes all present.
+        inputs: dict modality -> model input (e.g. ME.SparseTensor)
+        available_mask: [B, M] float/bool mask (1 if modality present for sample)
 
-        Returns: fused logits [B, C]
+        Returns: fused logits [B, C].
         """
-        # Run base models
         logits_list = []
         B = None
 
         for m in self.mod_names:
             if m not in inputs:
                 raise KeyError(f"Missing modality '{m}' in inputs. Expected keys={self.mod_names}")
-            z = _forward_one(self.models[m], inputs[m])  # [B, C]
+            z = _call(self.models[m], inputs[m])  # [B,C]
 
             if z.shape[1] != self.C:
                 raise ValueError(
@@ -119,10 +77,9 @@ class LateFusionClassifier(nn.Module):
 
             logits_list.append(z)
 
-        # Stack: [M, B, C]
-        logits = torch.stack(logits_list, dim=0)
+        # [B,M,C]
+        logits = torch.stack(logits_list, dim=1)
 
-        # Build availability mask
         if available_mask is None:
             avail = torch.ones((B, self.M), device=logits.device, dtype=logits.dtype)
         else:
@@ -130,41 +87,6 @@ class LateFusionClassifier(nn.Module):
                 raise ValueError(f"available_mask must be [B, M]=[{B},{self.M}]")
             avail = available_mask.to(device=logits.device, dtype=logits.dtype)
 
-        # Normalize availability to avoid division by zero
-        avail_sum = avail.sum(dim=1, keepdim=True).clamp_min(1.0)  # [B,1]
-
-        if self.fusion == "mean_logits":
-            # Masked mean over modalities
-            # logits: [M,B,C] -> [B,M,C]
-            lbm = logits.permute(1, 0, 2)
-            fused = (lbm * avail.unsqueeze(-1)).sum(dim=1) / avail_sum  # [B,C]
-            return fused
-
-        if self.fusion == "weighted_logits":
-            # Global weights, but masked per sample
-            w = F.softmax(self.logit_weights, dim=0)  # [M]
-            # Apply per-sample availability and renormalize
-            w_bm = w.unsqueeze(0).expand(B, -1) * avail  # [B,M]
-            w_bm = w_bm / w_bm.sum(dim=1, keepdim=True).clamp_min(1e-8)
-            fused = (logits.permute(1, 0, 2) * w_bm.unsqueeze(-1)).sum(dim=1)
-            return fused
-
-        if self.fusion == "meta_mlp":
-            # Concatenate logits, but zero out missing modalities
-            lbm = logits.permute(1, 0, 2) * avail.unsqueeze(-1)  # [B,M,C]
-            feat = lbm.reshape(B, self.M * self.C)  # [B, M*C]
-            fused = self.meta(feat)  # [B,C]
-            return fused
-
-        if self.fusion == "gated_logits":
-            lbm = logits.permute(1, 0, 2)  # [B,M,C]
-            feat = (lbm * avail.unsqueeze(-1)).reshape(B, self.M * self.C)
-            gate_logits = self.gate(feat)  # [B,M]
-            gate_w = F.softmax(gate_logits, dim=1)  # [B,M]
-            # Mask + renormalize
-            gate_w = gate_w * avail
-            gate_w = gate_w / gate_w.sum(dim=1, keepdim=True).clamp_min(1e-8)
-            fused = (lbm * gate_w.unsqueeze(-1)).sum(dim=1)  # [B,C]
-            return fused
-
-        raise RuntimeError("Unreachable: fusion mode not handled")
+        sum_logits = (logits * avail.unsqueeze(-1)).sum(dim=1)  # [B,C]
+        fused = torch.exp(self.log_scale) * sum_logits + self.bias
+        return fused

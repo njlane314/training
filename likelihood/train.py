@@ -62,7 +62,7 @@ def train_llr():
         name: SparseUResNetEncoderClassifier(in_ch=2, base=32).to(device)
         for name in planes
     }
-    model = LateFusionClassifier(models=models, num_classes=1, fusion="gated_logits").to(device)
+    model = LateFusionClassifier(models=models, num_classes=1).to(device)
     opt = torch.optim.SGD(
         model.parameters(),
         lr=cfg.LR0,
