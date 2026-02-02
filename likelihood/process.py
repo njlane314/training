@@ -1,6 +1,7 @@
 # make_shards.py
 import glob
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -76,13 +77,28 @@ def write_shards_from_root():
     if idx_path.exists():
         idx_path.unlink()
 
+    start_time = time.monotonic()
+
+    def format_eta(seconds: float) -> str:
+        if not np.isfinite(seconds) or seconds < 0:
+            return "--:--:--"
+        minutes, sec = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+
     def render_progress(current: int, total: int, width: int = 40) -> None:
         if total <= 0:
             return
         ratio = min(max(current / total, 0.0), 1.0)
         filled = int(ratio * width)
         bar = "=" * filled + "-" * (width - filled)
-        print(f"\rProcessing events: |{bar}| {current}/{total}", end="", flush=True)
+        if current > 0:
+            elapsed = time.monotonic() - start_time
+            remaining = (total - current) * (elapsed / current)
+            eta = format_eta(remaining)
+        else:
+            eta = "--:--:--"
+        print(f"\rProcessing events: |{bar}| {current}/{total} ETA {eta}", end="", flush=True)
 
     with uproot.open(cfg.ROOT_FILE) as f:
         t = f[cfg.TREE]
