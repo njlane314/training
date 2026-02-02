@@ -6,13 +6,13 @@ This repository trains a sparse 3D MinkowskiEngine U-Net classifier on DUNE-styl
 
 ```bash
 # 1) Prepare shards from the ROOT file
-python scripts/prepare_shards.py
+python scripts/prepare.py
 
 # 2) (Optional) sanity/overfit check
 python scripts/overfit_check.py
 
 # 3) Train
-python train.py
+python scripts/train.py
 ```
 
 If you need a full workflow script with environment variables, see [`workflow_updated.cmds`](workflow_updated.cmds) or the SLURM-friendly [`workflow.sh`](workflow.sh).
@@ -22,7 +22,7 @@ If you need a full workflow script with environment variables, see [`workflow_up
 - `likelihood/data.py` — ROOT ingestion, sparse conversion, sharding, and datasets.
 - `likelihood/model.py` — MinkowskiEngine U-Net classifier.
 - `likelihood/train.py` — training loop with balanced batches and EMA metrics.
-- `scripts/prepare_shards.py` — shard creation entry point.
+- `scripts/prepare.py` — shard creation entry point.
 - `scripts/overfit_check.py` — quick overfit diagnostic.
 
 ## Data pipeline (technical details)
