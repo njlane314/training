@@ -1,346 +1,188 @@
-import csv
-import math
-import os
-import random
-import time
-
+# train_llr.py
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.multiprocessing as mp
-from torch.cuda.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import LambdaLR
 
 import MinkowskiEngine as ME
 
-from . import config as cfg
-from .data import BalancedBatchSampler, ShardDataset, collate
-from .model import MinkUNetClassifier
+from lar_dataset import ShardDataset, InfiniteCorrectedBalancedBatchSampler, collate_me
+
+# -------------------------
+# Edit these few constants
+# -------------------------
+SHARDS_DIR = "shards"
+SEED = 123
+BATCH_SIZE = 16
+NUM_WORKERS = 4
+
+MAX_STEPS = 200_000
+LR0 = 1e-1
+WEIGHT_DECAY = 1e-4
+MOMENTUM = 0.9
+POLY_POWER = 0.9
+
+VAL_FRACTION = 0.1
+VAL_EVERY = 2000
+VAL_BATCHES = 50  # keep cheap
 
 
-def stratified_split(labels, frac, seed):
+class ResBlock(nn.Module):
+    def __init__(self, cin, cout, D=3, ks=(3, 3, 3)):
+        super().__init__()
+        self.conv1 = ME.MinkowskiSubmanifoldConvolution(cin, cout, kernel_size=ks, dimension=D, bias=False)
+        self.bn1 = ME.MinkowskiBatchNorm(cout)
+        self.conv2 = ME.MinkowskiSubmanifoldConvolution(cout, cout, kernel_size=ks, dimension=D, bias=False)
+        self.bn2 = ME.MinkowskiBatchNorm(cout)
+        self.relu = ME.MinkowskiReLU(inplace=True)
+
+        self.proj = None
+        if cin != cout:
+            self.proj = nn.Sequential(
+                ME.MinkowskiLinear(cin, cout, bias=False),
+                ME.MinkowskiBatchNorm(cout),
+            )
+
+    def forward(self, x):
+        identity = x if self.proj is None else self.proj(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.relu(out + identity)
+        return out
+
+
+class SparseUResNetEncoderClassifier(nn.Module):
     """
-    @brief Split indices into stratified train/validation sets.
+    UResNet-style residual encoder + global pooling head for event-level LLR.
+    Input coords: (batch, plane, y, x) with D=3 spatial dims (plane,y,x).
     """
-    rng = np.random.default_rng(seed)
-    idx = np.arange(labels.shape[0], dtype=np.int64)
-    sig = idx[labels == 1]
-    bkg = idx[labels == 0]
-    rng.shuffle(sig)
-    rng.shuffle(bkg)
-    ns = int(round(sig.size * frac))
-    nb = int(round(bkg.size * frac))
-    val = np.concatenate([sig[:ns], bkg[:nb]])
-    trn = np.concatenate([sig[ns:], bkg[nb:]])
-    rng.shuffle(val)
-    rng.shuffle(trn)
-    return trn, val
+
+    def __init__(self, in_ch=3, base=32, D=3):
+        super().__init__()
+        self.D = D
+
+        # Keep it simple: isotropic kernels, downsample only in (y,x)
+        self.stem = nn.Sequential(
+            ME.MinkowskiSubmanifoldConvolution(in_ch, base, kernel_size=3, dimension=D, bias=False),
+            ME.MinkowskiBatchNorm(base),
+            ME.MinkowskiReLU(inplace=True),
+        )
+
+        self.b0 = ResBlock(base, base, D=D)
+        self.down1 = ME.MinkowskiConvolution(base, base * 2, kernel_size=(1, 2, 2), stride=(1, 2, 2), dimension=D, bias=False)
+        self.b1 = ResBlock(base * 2, base * 2, D=D)
+
+        self.down2 = ME.MinkowskiConvolution(base * 2, base * 4, kernel_size=(1, 2, 2), stride=(1, 2, 2), dimension=D, bias=False)
+        self.b2 = ResBlock(base * 4, base * 4, D=D)
+
+        self.down3 = ME.MinkowskiConvolution(base * 4, base * 8, kernel_size=(1, 2, 2), stride=(1, 2, 2), dimension=D, bias=False)
+        self.b3 = ResBlock(base * 8, base * 8, D=D)
+
+        self.pool = ME.MinkowskiGlobalMaxPooling()
+        self.head = nn.Linear(base * 8, 1)
+
+    def forward(self, x: ME.SparseTensor):
+        x = self.stem(x)
+        x = self.b0(x)
+        x = self.b1(self.down1(x))
+        x = self.b2(self.down2(x))
+        x = self.b3(self.down3(x))
+        x = self.pool(x)          # one feature vector per batch item
+        return self.head(x.F).squeeze(1)  # logits
 
 
-def sample_probe_indices(labels, batch, rng):
-    """
-    @brief Select a random probe batch for validation monitoring.
-    """
-    h = batch // 2
-    sig = np.where(labels == 1)[0]
-    bkg = np.where(labels == 0)[0]
-    if sig.size < h or bkg.size < h:
-        raise ValueError("not enough events for probe batch")
-    s = rng.choice(sig, size=h, replace=False)
-    b = rng.choice(bkg, size=h, replace=False)
-    p = np.concatenate([s, b]).astype(np.int64, copy=False)
-    rng.shuffle(p)
-    return p
-
-
-def cosine_warmup(optimizer, total_steps: int, warmup_ratio: float = 0.02, min_lr_ratio: float = 0.05):
-    warmup_steps = int(total_steps * warmup_ratio)
-    warmup_steps = max(1, min(warmup_steps, total_steps - 1))
-
-    def lr_lambda(step: int):
-        if step < warmup_steps:
-            return (step + 1) / warmup_steps
-        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * t))
-
-    return LambdaLR(optimizer, lr_lambda)
-
-
-def attach_grad_hooks(model: nn.Module):
-    handles = []
-
-    def bwd_hook(mod, grad_input, grad_output):
-        # grad_output is a tuple; take first tensor-like entry if present
-        go = None
-        if isinstance(grad_output, (tuple, list)) and len(grad_output) > 0:
-            go = grad_output[0]
-        if go is None or not torch.is_tensor(go):
-            return
-        g = go.detach()
-        gnorm = float(g.float().norm().item())
-        gmax = float(g.float().abs().max().item())
-        print(f"    [bwd] {mod.__class__.__name__:<24} ‖g‖={gnorm:.3e} max|g|={gmax:.3e}", flush=True)
-
-    for m in model.modules():
-        # avoid very noisy hooks unless you want everything
-        if isinstance(m, (ME.MinkowskiConvolution, ME.MinkowskiBatchNorm, ME.MinkowskiLinear)):
-            handles.append(m.register_full_backward_hook(bwd_hook))
-
-    return handles
+def poly_lr(step, max_steps, lr0, power):
+    t = min(step / max_steps, 1.0)
+    return lr0 * (1.0 - t) ** power
 
 
 def main():
-    """
-    @brief Train a MinkowskiEngine UNet classifier end-to-end.
-    """
-    try:
-        mp.set_start_method("forkserver", force=True)
-    except RuntimeError:
-        pass
-
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-    random.seed(cfg.SEED)
-    np.random.seed(cfg.SEED)
-    torch.manual_seed(cfg.SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.SEED)
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = bool(cfg.AMP and device.type == "cuda")
-    scaler = GradScaler(enabled=use_amp)
-    probe_every = max(1, int(getattr(cfg, "VAL_PROBE_EVERY", 1)))
 
-    env_lr = os.environ.get("LR")
-    print(f"Using LR={cfg.LR} (env LR={env_lr})", flush=True)
+    meta = torch.load(f"{SHARDS_DIR}/index.pt", map_location="cpu")
+    n = int(meta["n_events"])
+    rng = np.random.default_rng(SEED)
+    perm = rng.permutation(n)
+    n_val = int(VAL_FRACTION * n)
 
-    meta = torch.load(os.path.join(cfg.SHARDS_DIR, "index.pt"), map_location="cpu")
-    labels_all = np.asarray(meta["labels"], dtype=np.uint8)
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
 
-    trn_idx, val_idx = stratified_split(labels_all, cfg.VAL_FRAC, cfg.SEED)
-    trn_idx = np.sort(trn_idx)
-    val_idx = np.sort(val_idx)
+    ds_train = ShardDataset(SHARDS_DIR, train_idx, cache_size=2)
+    ds_val = ShardDataset(SHARDS_DIR, val_idx, cache_size=2)
 
-    trn_ds = ShardDataset(cfg.SHARDS_DIR, trn_idx)
-    val_ds = ShardDataset(cfg.SHARDS_DIR, val_idx)
+    batch_sampler = InfiniteCorrectedBalancedBatchSampler(ds_train, batch_size=BATCH_SIZE, seed=SEED)
 
-    trn_bs = BalancedBatchSampler(
-        trn_ds.labels,
-        trn_ds.shard_ids,
-        trn_ds.local_ids,
-        cfg.BATCH,
-        cfg.SEED,
-        steps=cfg.STEPS_PER_EPOCH,
-    )
-    trn_loader = torch.utils.data.DataLoader(
-        trn_ds,
-        batch_sampler=trn_bs,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(cfg.NUM_WORKERS > 0),
-        multiprocessing_context="forkserver" if cfg.NUM_WORKERS > 0 else None,
-        prefetch_factor=2 if cfg.NUM_WORKERS > 0 else None,
-        timeout=120 if cfg.NUM_WORKERS > 0 else 0,
-        collate_fn=collate,
+    dl_train = torch.utils.data.DataLoader(
+        ds_train,
+        batch_sampler=batch_sampler,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_me,
+        pin_memory=True,
+        persistent_workers=(NUM_WORKERS > 0),
     )
 
-    probe_rng = np.random.default_rng(cfg.SEED + 999)
-
-    model = MinkUNetClassifier(in_channels=4, base=cfg.BASE_FILTERS, strides=cfg.NUM_STRIDES, dropout=cfg.DROPOUT).to(
-        device
+    dl_val = torch.utils.data.DataLoader(
+        ds_val,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_me,
+        pin_memory=True,
+        persistent_workers=(NUM_WORKERS > 0),
     )
-    grad_handles = []
-    if os.environ.get("DEBUG_GRADS", "0") != "0":
-        grad_handles = attach_grad_hooks(model)
-    # Weight-movement probes (simple, robust: linear head weights are always torch.Parameters)
-    w_head0_0 = model.head[0].weight.detach().clone()
-    w_head1_0 = model.head[-1].weight.detach().clone()
-    print("\n--- Model Architecture (MinkUNet Classifier) ---")
-    print(model)
-    print("--------------------------------------------------")
-    opt = optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
-    accum = max(1, int(cfg.GRAD_ACCUM_STEPS))
-    sched = None
-    if getattr(cfg, "SCHED", False):
-        total_steps = int(cfg.EPOCHS) * int(math.ceil(len(trn_loader) / accum))
-        sched = cosine_warmup(
-            opt,
-            total_steps=total_steps,
-            warmup_ratio=cfg.WARMUP_RATIO,
-            min_lr_ratio=cfg.MIN_LR_RATIO,
-        )
-    loss_fn = nn.BCEWithLogitsLoss()
 
-    t0 = time.time()
-    c, f, y = next(iter(trn_loader))
-    t1 = time.time()
-    print(f"warmup {t1-t0:.2f}s nnz={int(f.shape[0])} y_mean={float(y.mean()):.3f}", flush=True)
-    print("\n--- Model Summary (torchinfo) ---", flush=True)
-    try:
-        import torchinfo
-    except ModuleNotFoundError:
-        print("torchinfo not installed; skipping model summary.", flush=True)
-    else:
-        try:
-            summary = torchinfo.summary(
-                model,
-                input_data=(ME.SparseTensor(f, c, device=device),),
-                verbose=0,
-            )
-            print(summary, flush=True)
-        except Exception as exc:
-            print(f"torchinfo summary failed: {exc}", flush=True)
-    print("--------------------------------------------------", flush=True)
+    model = SparseUResNetEncoderClassifier(in_ch=3, base=32, D=3).to(device)
+    opt = torch.optim.SGD(model.parameters(), lr=LR0, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    loss_fn = nn.BCEWithLogitsLoss()  # unweighted
 
-    best = float("inf")
-    ema_t = None
-    ema_v = None
-    last_vl = None
-    last_vacc = None
-    step0 = 0
-    micro_step = 0
+    it = iter(dl_train)
 
-    log_handle = None
-    log_writer = None
-    if cfg.LOG_OUT:
-        needs_header = True
-        if os.path.exists(cfg.LOG_OUT) and os.path.getsize(cfg.LOG_OUT) > 0:
-            needs_header = False
-        log_handle = open(cfg.LOG_OUT, "a", buffering=1, encoding="utf-8", newline="")
-        log_writer = csv.writer(log_handle)
-        if needs_header:
-            log_writer.writerow(
-                ["epoch", "step", "lr", "train", "val", "ema_train", "ema_val", "acc", "vacc"]
-            )
+    for step in range(1, MAX_STEPS + 1):
+        model.train()
+        coords, feats, y = next(it)
+        coords = coords.to(device, non_blocking=True)
+        feats = feats.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
-    try:
-        for epoch in range(cfg.EPOCHS):
-            trn_bs.set_epoch(epoch)
-            model.train()
-            for i, (coords, feats, y) in enumerate(trn_loader):
-                x = ME.SparseTensor(feats, coords, device=device)
-                y = y.to(device, non_blocking=True).float().view(-1)
+        x = ME.SparseTensor(features=feats, coordinates=coords, device=device)
+        logits = model(x)
+        loss = loss_fn(logits, y)
 
-                if micro_step % accum == 0:
-                    opt.zero_grad(set_to_none=True)
-                with autocast(enabled=use_amp):
-                    logits = model(x).view(-1)
-                    tloss = loss_fn(logits, y)
-                    # If accumulating, backprop the mean gradient (keeps effective LR stable).
-                    loss_to_bp = tloss / float(accum)
-                if use_amp:
-                    scaler.scale(loss_to_bp).backward()
-                else:
-                    loss_to_bp.backward()
-                micro_step += 1
-                stepped = False
-                if micro_step % accum == 0:
-                    if cfg.GRAD_CLIP and cfg.GRAD_CLIP > 0:
-                        if use_amp:
-                            scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-                    if use_amp:
-                        scaler.step(opt)
-                        scaler.update()
-                    else:
-                        opt.step()
-                    if sched is not None:
-                        sched.step()
-                    stepped = True
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
 
-                # Probe val only on optimizer steps (or first time), to reduce noise/overhead.
-                do_probe = (last_vl is None) or (stepped and (step0 % probe_every == 0))
-                if do_probe:
-                    model.eval()
-                    with torch.no_grad(), autocast(enabled=use_amp):
-                        probe_local = sample_probe_indices(val_ds.labels, cfg.BATCH, probe_rng)
-                        vb = val_ds.__getitems__(probe_local)
-                        vcoords, vfeats, vy = collate(vb)
-                        vprobe_x = ME.SparseTensor(vfeats, vcoords, device=device)
-                        vprobe_y = vy.to(device, non_blocking=True).float().view(-1)
-                        vlogits = model(vprobe_x).view(-1)
-                        vloss = loss_fn(vlogits, vprobe_y)
-                        vacc = (vlogits > 0).eq(vprobe_y > 0.5).float().mean().item()
-                    model.train()
-                    last_vl = float(vloss.item())
-                    last_vacc = float(vacc)
+        # Poly LR schedule
+        lr = poly_lr(step, MAX_STEPS, LR0, POLY_POWER)
+        for pg in opt.param_groups:
+            pg["lr"] = lr
 
-                tl = float(tloss.item())
-                vl = float(last_vl) if last_vl is not None else float("nan")
-                ema_t = tl if ema_t is None else (cfg.EMA * ema_t + (1.0 - cfg.EMA) * tl)
-                if do_probe:
-                    ema_v = vl if ema_v is None else (cfg.EMA * ema_v + (1.0 - cfg.EMA) * vl)
+        if step % 200 == 0:
+            with torch.no_grad():
+                p = torch.sigmoid(logits)
+                acc = ((p > 0.5) == (y > 0.5)).float().mean().item()
+            print(f"step {step:7d}  loss {loss.item():.4f}  acc {acc:.3f}  lr {lr:.3e}")
 
-                tacc = (logits > 0).eq(y > 0.5).float().mean().item()
-                vacc = float(last_vacc) if last_vacc is not None else float("nan")
-                lr = opt.param_groups[0]["lr"]
-                if stepped:
-                    step0 += 1
-                step = step0
-                line = (
-                    f"{epoch+1:03d} {step:07d} lr={lr:.2e} train={tl:.6f} val={vl:.6f} "
-                    f"ema={ema_t:.6f}/{ema_v:.6f} acc={tacc:.3f} vacc={vacc:.3f}"
-                )
-                print(line, flush=True)
-                # Debug prints: logits/statistics + weight movement every 50 optimizer steps
-                if stepped and (step % 50 == 0):
-                    with torch.no_grad():
-                        lf = logits.float()
-                        l_mu = float(lf.mean().item())
-                        l_sd = float(lf.std(unbiased=False).item())
-                        p = torch.sigmoid(lf)
-                        p_mu = float(p.mean().item())
-                        p_sd = float(p.std(unbiased=False).item())
-                        dw0 = float((model.head[0].weight.detach() - w_head0_0).abs().mean().item())
-                        dw1 = float((model.head[-1].weight.detach() - w_head1_0).abs().mean().item())
-                    print(
-                        f"    logits μ/σ={l_mu:+.3e}/{l_sd:.3e}  p μ/σ={p_mu:.3f}/{p_sd:.3f}  "
-                        f"ΔW_head0={dw0:.3e}  ΔW_head1={dw1:.3e}",
-                        flush=True,
-                    )
-                if log_writer is not None:
-                    log_writer.writerow(
-                        [epoch + 1, step, lr, tl, vl, ema_t, ema_v, tacc, vacc]
-                    )
+        if step % VAL_EVERY == 0:
+            model.eval()
+            tot = 0.0
+            cnt = 0
+            with torch.no_grad():
+                for bi, (coords, feats, y) in enumerate(dl_val):
+                    if bi >= VAL_BATCHES:
+                        break
+                    coords = coords.to(device, non_blocking=True)
+                    feats = feats.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    x = ME.SparseTensor(features=feats, coordinates=coords, device=device)
+                    logits = model(x)
+                    tot += loss_fn(logits, y).item()
+                    cnt += 1
+            print(f"[val] step {step:7d}  loss {tot/max(cnt,1):.4f}")
 
-            if micro_step % accum != 0:
-                if cfg.GRAD_CLIP and cfg.GRAD_CLIP > 0:
-                    if use_amp:
-                        scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-                if use_amp:
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    opt.step()
-                if sched is not None:
-                    sched.step()
-                step0 += 1
-                micro_step = 0
 
-            if ema_v is not None and ema_v < best:
-                best = float(ema_v)
-                torch.save(
-                    {
-                        "epoch": int(epoch + 1),
-                        "step": int(step0),
-                        "model": model.state_dict(),
-                        "opt": opt.state_dict(),
-                        "sched": sched.state_dict() if sched is not None else None,
-                        "scaler": scaler.state_dict() if use_amp else None,
-                        "best_ema_val": best,
-                        "cfg": {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()},
-                    },
-                    cfg.OUT,
-                )
-
-        torch.save({"epoch": int(cfg.EPOCHS), "step": int(step0), "model": model.state_dict()}, cfg.OUT)
-    finally:
-        for handle in grad_handles:
-            handle.remove()
-        if log_handle is not None:
-            log_handle.close()
+if __name__ == "__main__":
+    main()
