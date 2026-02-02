@@ -10,11 +10,9 @@ from .dataset import BalancedBatchSampler, ShardDataset, collate_me_fusion
 from .fusion import LateFusionClassifier
 from .model import SparseUResNetEncoderClassifier
 
-
 def poly_lr(step, max_steps, lr0, power):
     t = min(step / max_steps, 1.0)
     return lr0 * (1.0 - t) ** power
-
 
 def train_llr():
     torch.manual_seed(cfg.SEED)
