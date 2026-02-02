@@ -1,4 +1,4 @@
-# train_llr.py
+# train.py
 import numpy as np
 import torch
 import torch.nn as nn

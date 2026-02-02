@@ -49,7 +49,7 @@ export DROPOUT=0.2
 # ## --- Create Shards --- ##
 # ============================================================================== 
 
-python scripts/prepare_shards.py
+python scripts/prepare.py
 
 
 # ==============================================================================
@@ -70,4 +70,4 @@ python scripts/overfit_check.py
 # ## --- Train --- ##
 # ============================================================================== 
 
-python train.py
+python scripts/train.py
