@@ -85,7 +85,7 @@ def pack_events(coords_list, feats_list):
     )
 
 
-def main():
+def write_shards_from_root():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for p in glob.glob(str(OUT_DIR / "shard_*.pt")):
         os.remove(p)
@@ -170,7 +170,3 @@ def main():
         )
 
     print(f"wrote {shard_id} shards to {OUT_DIR} (events={n_events})")
-
-
-if __name__ == "__main__":
-    main()
