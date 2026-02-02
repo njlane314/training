@@ -9,8 +9,6 @@ import uproot
 
 from . import config as cfg
 
-
-
 def plane_to_sparse(flat: np.ndarray, plane: int):
     flat = np.asarray(flat, dtype=np.float32).reshape(-1)
     if flat.size != cfg.H * cfg.W:
