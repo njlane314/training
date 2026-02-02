@@ -20,7 +20,9 @@ H = _env("H", 512, int)
 W = _env("W", 512, int)
 
 THRESH = _env("THRESH", 0.0, float)
-BACKBONE = os.environ.get("BACKBONE", "small")
+
+# Model (keep minimal; pick a preset backbone + embedding width)
+BACKBONE = os.environ.get("BACKBONE", "small")   # {tiny, small, base, wide}
 EMBED_DIM = _env("EMBED_DIM", 256, int)
 SHARD_EVENTS = _env("SHARD_EVENTS", 2048, int)
 CHUNK_EVENTS = _env("CHUNK_EVENTS", 64, int)
