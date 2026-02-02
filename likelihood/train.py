@@ -7,7 +7,7 @@ import MinkowskiEngine as ME
 
 from . import config as cfg
 from .dataset import ShardDataset, InfiniteCorrectedBalancedBatchSampler, collate_me
-from .model import SparseUResNetEncoderClassifier
+from .model import UResNetClassifier
 
 
 def poly_lr(step, max_steps, lr0, power):
@@ -58,7 +58,7 @@ def train_llr():
         persistent_workers=(cfg.LLR_NUM_WORKERS > 0),
     )
 
-    model = SparseUResNetEncoderClassifier(in_ch=3, base=32, D=3).to(device)
+    model = UResNetClassifier(in_ch=3, base=32, D=3).to(device)
     opt = torch.optim.SGD(
         model.parameters(),
         lr=cfg.LLR_LR0,
