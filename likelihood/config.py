@@ -1,6 +1,5 @@
 import os
 
-
 def _env(name, default, cast):
     """
     @brief Read and cast an environment variable with a default.
