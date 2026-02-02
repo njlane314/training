@@ -10,6 +10,9 @@ import uproot
 
 from . import config as cfg
 
+_DUMMY_COORDS = np.array([[0, 0, 0]], dtype=np.int32)
+_DUMMY_FEATS = np.array([[0.0, 0.0]], dtype=np.float16)
+
 def plane_to_sparse(
     flat: np.ndarray,
     plane: int,
@@ -44,30 +47,47 @@ def plane_to_sparse(
 
 
 def event_to_sparse(u, v, w):
-    coords_list, feats_list = [], []
-    for plane, arr in enumerate((u, v, w)):
-        c, f = plane_to_sparse(arr, plane)
-        if c is not None:
-            coords_list.append(c)
-            feats_list.append(f)
+    iu = np.flatnonzero(u > cfg.THRESH)
+    iv = np.flatnonzero(v > cfg.THRESH)
+    iw = np.flatnonzero(w > cfg.THRESH)
 
-    if not coords_list:
-        # single dummy site (keeps downstream code simple)
-        coords = np.array([[0, 0, 0]], dtype=np.int32)
-        feats = np.array([[0.0, 0.0]], dtype=np.float32)
-        return coords, feats
+    total = iu.size + iv.size + iw.size
+    if total == 0:
+        return _DUMMY_COORDS, _DUMMY_FEATS
 
-    return np.concatenate(coords_list, axis=0), np.concatenate(feats_list, axis=0)
+    coords = np.empty((total, 3), dtype=np.int32)
+    feats = np.empty((total, 2), dtype=np.float16)
+
+    off = 0
+    for plane, (arr, idx) in enumerate(((u, iu), (v, iv), (w, iw))):
+        n = idx.size
+        if n == 0:
+            continue
+
+        sl = slice(off, off + n)
+        coords[sl, 0] = plane
+        np.floor_divide(idx, cfg.W, out=coords[sl, 1], casting="unsafe")
+        np.remainder(idx, cfg.W, out=coords[sl, 2], casting="unsafe")
+
+        feats[sl, 0] = 1.0
+        vals = arr[idx]
+        np.maximum(vals, 0.0, out=vals)
+        np.log1p(vals, out=vals)
+        feats[sl, 1] = vals
+
+        off += n
+
+    return coords, feats
 
 
 def pack_events(coords_list, feats_list):
-    n = len(coords_list)
-    starts = np.zeros(n + 1, dtype=np.int64)
-    for i, c in enumerate(coords_list):
-        starts[i + 1] = starts[i] + int(c.shape[0])
+    lengths = np.fromiter((c.shape[0] for c in coords_list), dtype=np.int64, count=len(coords_list))
+    starts = np.empty(len(lengths) + 1, dtype=np.int64)
+    starts[0] = 0
+    np.cumsum(lengths, out=starts[1:])
 
-    coords = np.concatenate(coords_list, axis=0).astype(np.int32, copy=False)
-    feats = np.concatenate(feats_list, axis=0).astype(np.float16, copy=False)
+    coords = np.concatenate(coords_list, axis=0)
+    feats = np.concatenate(feats_list, axis=0)
 
     return (
         torch.from_numpy(coords),
@@ -111,9 +131,9 @@ def write_shards_from_root():
     with uproot.open(cfg.ROOT_FILE) as f:
         t = f[cfg.TREE]
 
-        labels = t[cfg.BR_Y].array(library="np").astype(np.uint8).reshape(-1)
-        weights = t[cfg.BR_WGT].array(library="np").astype(np.float32).reshape(-1)
-        n_events = int(labels.shape[0])
+        n_events = int(t.num_entries)
+        labels = np.empty(n_events, dtype=np.uint8)
+        weights = np.empty(n_events, dtype=np.float32)
 
         nnz = np.zeros(n_events, dtype=np.int32)
 
@@ -127,9 +147,20 @@ def write_shards_from_root():
 
         for start in range(0, n_events, cfg.CHUNK_EVENTS):
             stop = min(start + cfg.CHUNK_EVENTS, n_events)
-            a = t.arrays([cfg.BR_U, cfg.BR_V, cfg.BR_W], entry_start=start, entry_stop=stop, library="np")
+            a = t.arrays(
+                [cfg.BR_U, cfg.BR_V, cfg.BR_W, cfg.BR_Y, cfg.BR_WGT],
+                entry_start=start,
+                entry_stop=stop,
+                library="np",
+            )
 
             uu, vv, ww = a[cfg.BR_U], a[cfg.BR_V], a[cfg.BR_W]
+            labels[start:stop] = a[cfg.BR_Y].astype(np.uint8, copy=False).reshape(-1)
+            weights[start:stop] = a[cfg.BR_WGT].astype(np.float32, copy=False).reshape(-1)
+
+            uu = uu.reshape(-1, cfg.H * cfg.W).astype(np.float32, copy=False)
+            vv = vv.reshape(-1, cfg.H * cfg.W).astype(np.float32, copy=False)
+            ww = ww.reshape(-1, cfg.H * cfg.W).astype(np.float32, copy=False)
 
             for j in range(stop - start):
                 gi = start + j
