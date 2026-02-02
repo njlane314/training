@@ -1,92 +1,59 @@
-from typing import Any, Dict, Mapping, Optional
+from __future__ import annotations
+
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-
-def _call(model: nn.Module, x: Any) -> torch.Tensor:
-    if isinstance(x, Mapping):
-        out = model(**x)
-    else:
-        out = model(x)
-    if not isinstance(out, torch.Tensor):
-        raise TypeError("Base model must return a torch.Tensor.")
-    if out.ndim == 1:
-        out = out.unsqueeze(1)
-    if out.ndim != 2:
-        raise ValueError(f"Expected logits [B,C]. Got {tuple(out.shape)}")
-    return out
+import MinkowskiEngine as ME
 
 
-class LateFusionClassifier(nn.Module):
-    """
-    Product-of-experts (PoE) fusion in logit space.
-
-    If each per-plane model is trained with balanced class prior (p(sig)=p(bkg)=0.5),
-    its output logit is an estimator of the per-plane log-likelihood ratio (LLR).
-    Under conditional independence, the fused LLR is the sum of available logits.
-
-    We include a tiny calibration head: fused = exp(log_scale) * sum_logits + bias.
-    """
-
-    def __init__(
-        self,
-        models: Dict[str, nn.Module],
-        num_classes: int = 1,
-    ):
+class ViewAttentionPool(nn.Module):
+    def __init__(self, d: int):
         super().__init__()
-        if not models:
-            raise ValueError("models must be a non-empty dict of modality -> model")
+        self.score = nn.Sequential(
+            nn.Linear(d, d),
+            nn.ReLU(inplace=True),
+            nn.Linear(d, 1),
+        )
 
-        self.models = nn.ModuleDict(models)
-        self.mod_names = list(models.keys())
-        self.M = len(self.mod_names)
-        self.C = int(num_classes)
+    def forward(self, Z: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        s = self.score(Z).squeeze(-1)
+        if mask is not None:
+            m = mask.to(dtype=torch.bool, device=Z.device)
+            s = s.masked_fill(~m, -1e9)
+        else:
+            m = None
+        w = torch.softmax(s, dim=1)
+        if m is not None:
+            w = w * m.to(dtype=w.dtype)
+            w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return (w.unsqueeze(-1) * Z).sum(dim=1)
 
-        self.log_scale = nn.Parameter(torch.zeros(()))
-        self.bias = nn.Parameter(torch.zeros(self.C))
+
+class MultiViewSetClassifier(nn.Module):
+    def __init__(self, backbone: nn.Module, embed_dim: int, plane_names: Tuple[str, ...] = ("u", "v", "w")):
+        super().__init__()
+        self.backbone = backbone
+        self.plane_names = tuple(plane_names)
+        self.num_views = len(self.plane_names)
+        self.embed_dim = int(embed_dim)
+        self.plane_emb = nn.Embedding(self.num_views, self.embed_dim)
+        nn.init.zeros_(self.plane_emb.weight)
+        self.pool = ViewAttentionPool(self.embed_dim)
+        self.head = nn.Linear(self.embed_dim, 1)
 
     def forward(
         self,
-        inputs: Dict[str, Any],
+        inputs: Dict[str, ME.SparseTensor],
         available_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        inputs: dict modality -> model input (e.g. ME.SparseTensor)
-        available_mask: [B, M] float/bool mask (1 if modality present for sample)
-
-        Returns: fused logits [B, C].
-        """
-        logits_list = []
-        B = None
-
-        for m in self.mod_names:
-            if m not in inputs:
-                raise KeyError(f"Missing modality '{m}' in inputs. Expected keys={self.mod_names}")
-            z = _call(self.models[m], inputs[m])  # [B,C]
-
-            if z.shape[1] != self.C:
-                raise ValueError(
-                    f"Modality '{m}' produced {z.shape[1]} classes; expected {self.C}"
-                )
-
-            if B is None:
-                B = z.shape[0]
-            elif z.shape[0] != B:
-                raise ValueError("All modalities must have the same batch size.")
-
-            logits_list.append(z)
-
-        # [B,M,C]
-        logits = torch.stack(logits_list, dim=1)
-
-        if available_mask is None:
-            avail = torch.ones((B, self.M), device=logits.device, dtype=logits.dtype)
-        else:
-            if available_mask.shape != (B, self.M):
-                raise ValueError(f"available_mask must be [B, M]=[{B},{self.M}]")
-            avail = available_mask.to(device=logits.device, dtype=logits.dtype)
-
-        sum_logits = (logits * avail.unsqueeze(-1)).sum(dim=1)  # [B,C]
-        fused = torch.exp(self.log_scale) * sum_logits + self.bias
-        return fused
+        Z = []
+        for pid, name in enumerate(self.plane_names):
+            x = inputs[name]
+            z = self.backbone(x)
+            z = z + self.plane_emb.weight[pid].unsqueeze(0)
+            Z.append(z)
+        Z = torch.stack(Z, dim=1)
+        pooled = self.pool(Z, mask=available_mask)
+        return self.head(pooled)
