@@ -4,7 +4,6 @@ from collections import OrderedDict
 import numpy as np
 import torch
 
-
 class ShardDataset(torch.utils.data.Dataset):
     """
     Loads sparse events from shard files created by make_shards.py.
