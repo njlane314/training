@@ -5,7 +5,7 @@ import torch.nn as nn
 
 import MinkowskiEngine as ME
 
-from lar_dataset import ShardDataset, InfiniteCorrectedBalancedBatchSampler, collate_me
+from .dataset import ShardDataset, InfiniteCorrectedBalancedBatchSampler, collate_me
 
 # -------------------------
 # Edit these few constants
@@ -95,7 +95,7 @@ def poly_lr(step, max_steps, lr0, power):
     return lr0 * (1.0 - t) ** power
 
 
-def main():
+def train_llr():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -182,7 +182,3 @@ def main():
                     tot += loss_fn(logits, y).item()
                     cnt += 1
             print(f"[val] step {step:7d}  loss {tot/max(cnt,1):.4f}")
-
-
-if __name__ == "__main__":
-    main()

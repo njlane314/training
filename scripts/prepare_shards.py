@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from likelihood.data import write_shards_from_root
+from likelihood.process import write_shards_from_root
 
 
 if __name__ == "__main__":
