@@ -16,8 +16,6 @@ BR_W = os.environ.get("BR_W", "detector_image_w")
 BR_Y = os.environ.get("BR_Y", "is_signal")
 BR_WGT = os.environ.get("BR_WGT", "w_nominal")
 
-PROCESS_OUT_DIR = os.environ.get("PROCESS_OUT_DIR", "shards")
-
 H = _env("H", 512, int)
 W = _env("W", 512, int)
 
@@ -25,7 +23,10 @@ THRESH = _env("THRESH", 0.0, float)
 SHARD_EVENTS = _env("SHARD_EVENTS", 2048, int)
 CHUNK_EVENTS = _env("CHUNK_EVENTS", 64, int)
 
-SHARDS_DIR = os.environ.get("SHARDS_DIR", "shards")
+# One canonical shards directory (used by both processing + training)
+SHARDS_DIR = os.environ.get("SHARDS_DIR", os.environ.get("PROCESS_OUT_DIR", "shards"))
+# Backward-compatible alias
+PROCESS_OUT_DIR = SHARDS_DIR
 SEED = _env("SEED", 123, int)
 BATCH_SIZE = _env("BATCH_SIZE", 16, int)
 NUM_WORKERS = _env("NUM_WORKERS", 4, int)

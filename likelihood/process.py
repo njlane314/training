@@ -26,11 +26,10 @@ def plane_to_sparse(flat: np.ndarray, plane: int):
     coords[:, 1] = y.astype(np.int32, copy=False)
     coords[:, 2] = x.astype(np.int32, copy=False)
 
-    # Features: occupancy, log-charge, plane-id
-    feats = np.empty((idx.size, 3), dtype=np.float32)
+    # Features: occupancy, log-charge
+    feats = np.empty((idx.size, 2), dtype=np.float32)
     feats[:, 0] = 1.0
     feats[:, 1] = np.log1p(np.maximum(val, 0.0))
-    feats[:, 2] = float(plane - 1)  # {-1,0,+1} for {U,V,W}
 
     return coords, feats
 
@@ -46,7 +45,7 @@ def event_to_sparse(u, v, w):
     if not coords_list:
         # single dummy site (keeps downstream code simple)
         coords = np.array([[0, 0, 0]], dtype=np.int32)
-        feats = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        feats = np.array([[0.0, 0.0]], dtype=np.float32)
         return coords, feats
 
     return np.concatenate(coords_list, axis=0), np.concatenate(feats_list, axis=0)
@@ -69,7 +68,7 @@ def pack_events(coords_list, feats_list):
 
 
 def write_shards_from_root():
-    out_dir = Path(cfg.PROCESS_OUT_DIR)
+    out_dir = Path(cfg.SHARDS_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     for p in glob.glob(str(out_dir / "shard_*.pt")):
         os.remove(p)
@@ -88,7 +87,8 @@ def write_shards_from_root():
 
         shard_id = 0
         shard_start = 0
-        coords_acc, feats_acc, y_acc = [], [], []
+        coords_acc, feats_acc = [], []
+        n_acc = 0
 
         for start in range(0, n_events, cfg.CHUNK_EVENTS):
             stop = min(start + cfg.CHUNK_EVENTS, n_events)
@@ -103,18 +103,17 @@ def write_shards_from_root():
 
                 coords_acc.append(c)
                 feats_acc.append(fe)
-                y_acc.append(int(labels[gi]))
+                n_acc += 1
 
-                if len(y_acc) == cfg.SHARD_EVENTS:
+                if n_acc == cfg.SHARD_EVENTS:
                     coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
                     torch.save(
                         {
                             "start_event": int(shard_start),
-                            "n_events": int(len(y_acc)),
+                            "n_events": int(n_acc),
                             "coords": coords_t,
                             "feats": feats_t,
                             "starts": starts_t,
-                            "labels": torch.tensor(y_acc, dtype=torch.uint8),
                         },
                         out_dir / f"shard_{shard_id:05d}.pt",
                     )
@@ -122,18 +121,17 @@ def write_shards_from_root():
                     shard_start = gi + 1
                     coords_acc.clear()
                     feats_acc.clear()
-                    y_acc.clear()
+                    n_acc = 0
 
-        if y_acc:
+        if n_acc:
             coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
             torch.save(
                 {
                     "start_event": int(shard_start),
-                    "n_events": int(len(y_acc)),
+                    "n_events": int(n_acc),
                     "coords": coords_t,
                     "feats": feats_t,
                     "starts": starts_t,
-                    "labels": torch.tensor(y_acc, dtype=torch.uint8),
                 },
                 out_dir / f"shard_{shard_id:05d}.pt",
             )
