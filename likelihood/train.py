@@ -6,7 +6,8 @@ import torch.nn as nn
 import MinkowskiEngine as ME
 
 from . import config as cfg
-from .dataset import ShardDataset, InfiniteCorrectedBalancedBatchSampler, collate_me
+from .dataset import ShardDataset, InfiniteCorrectedBalancedBatchSampler, collate_me_fusion
+from .fusion import LateFusionClassifier
 from .model import SparseUResNetEncoderClassifier
 
 
@@ -43,7 +44,7 @@ def train_llr():
         ds_train,
         batch_sampler=batch_sampler,
         num_workers=cfg.LLR_NUM_WORKERS,
-        collate_fn=collate_me,
+        collate_fn=collate_me_fusion,
         pin_memory=True,
         persistent_workers=(cfg.LLR_NUM_WORKERS > 0),
     )
@@ -53,12 +54,17 @@ def train_llr():
         batch_size=cfg.LLR_BATCH_SIZE,
         shuffle=False,
         num_workers=cfg.LLR_NUM_WORKERS,
-        collate_fn=collate_me,
+        collate_fn=collate_me_fusion,
         pin_memory=True,
         persistent_workers=(cfg.LLR_NUM_WORKERS > 0),
     )
 
-    model = SparseUResNetEncoderClassifier(in_ch=3, base=32, D=3).to(device)
+    plane_names = ("u", "v", "w")
+    models = {
+        name: SparseUResNetEncoderClassifier(in_ch=2, base=32)
+        for name in plane_names
+    }
+    model = LateFusionClassifier(models, num_classes=1, fusion="gated_logits").to(device)
     opt = torch.optim.SGD(
         model.parameters(),
         lr=cfg.LLR_LR0,
@@ -71,13 +77,21 @@ def train_llr():
 
     for step in range(1, cfg.LLR_MAX_STEPS + 1):
         model.train()
-        coords, feats, y = next(it)
-        coords = coords.to(device, non_blocking=True)
-        feats = feats.to(device, non_blocking=True)
+        inputs, available, y = next(it)
         y = y.to(device, non_blocking=True)
+        available = available.to(device, non_blocking=True)
 
-        x = ME.SparseTensor(features=feats, coordinates=coords, device=device)
-        logits = model(x)
+        sparse_inputs = {}
+        for name in plane_names:
+            coords = inputs[name]["coords"].to(device, non_blocking=True)
+            feats = inputs[name]["feats"].to(device, non_blocking=True)
+            sparse_inputs[name] = ME.SparseTensor(
+                features=feats,
+                coordinates=coords,
+                device=device,
+            )
+
+        logits = model(sparse_inputs, available_mask=available).squeeze(1)
         loss = loss_fn(logits, y)
 
         opt.zero_grad(set_to_none=True)
@@ -100,14 +114,23 @@ def train_llr():
             tot = 0.0
             cnt = 0
             with torch.no_grad():
-                for bi, (coords, feats, y) in enumerate(dl_val):
+                for bi, (inputs, available, y) in enumerate(dl_val):
                     if bi >= cfg.LLR_VAL_BATCHES:
                         break
-                    coords = coords.to(device, non_blocking=True)
-                    feats = feats.to(device, non_blocking=True)
                     y = y.to(device, non_blocking=True)
-                    x = ME.SparseTensor(features=feats, coordinates=coords, device=device)
-                    logits = model(x)
+                    available = available.to(device, non_blocking=True)
+
+                    sparse_inputs = {}
+                    for name in plane_names:
+                        coords = inputs[name]["coords"].to(device, non_blocking=True)
+                        feats = inputs[name]["feats"].to(device, non_blocking=True)
+                        sparse_inputs[name] = ME.SparseTensor(
+                            features=feats,
+                            coordinates=coords,
+                            device=device,
+                        )
+
+                    logits = model(sparse_inputs, available_mask=available).squeeze(1)
                     tot += loss_fn(logits, y).item()
                     cnt += 1
             print(f"[val] step {step:7d}  loss {tot/max(cnt,1):.4f}")

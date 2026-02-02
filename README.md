@@ -1,6 +1,6 @@
 # Sparse MinkowskiEngine Training
 
-This repository trains a sparse 3D MinkowskiEngine U-Net classifier on DUNE-style wire-plane images stored in a ROOT file. The pipeline converts dense 2D detector images from three views (U/V/W) into sparse tensors, shards the data to disk, and then trains a binary classifier with balanced mini-batches.
+This repository trains a sparse 2D MinkowskiEngine encoder per wire-plane view and fuses the per-plane logits for a final classifier on DUNE-style wire-plane images stored in a ROOT file. The pipeline converts dense 2D detector images from three views (U/V/W) into sparse tensors, shards the data to disk, and then trains a binary classifier with balanced mini-batches.
 
 ## Quick start
 
@@ -20,7 +20,7 @@ If you need a full workflow script with environment variables, see [`workflow_up
 ## Project layout
 
 - `likelihood/data.py` — ROOT ingestion, sparse conversion, sharding, and datasets.
-- `likelihood/model.py` — MinkowskiEngine U-Net classifier.
+- `likelihood/model.py` — 2D MinkowskiEngine encoder classifier.
 - `likelihood/train.py` — training loop with balanced batches and EMA metrics.
 - `scripts/prepare.py` — shard creation entry point.
 - `scripts/overfit_check.py` — quick overfit diagnostic.
@@ -67,17 +67,12 @@ The training loader uses `BalancedBatchSampler` to build class-balanced batches 
 
 ## Model architecture
 
-`MinkUNetClassifier` is a sparse 3D U-Net with residual blocks and global pooling:
+The LLR model uses three 2D residual encoders (one per plane) with late fusion over logits:
 
-- **Input normalization:** learnable shift and log-scale per feature channel.
-- **Encoder:** repeated residual blocks + strided convolutions.
-- **Decoder:** transposed convolutions with skip connections.
-- **Pooling:** global sum + max pooling.
-- **Classifier head:** MLP on pooled features plus a `log1p` count feature:
-  \[
-  z = [\text{sum\_pool}(x),\ \text{max\_pool}(x),\ \log(1 + N_{\text{points}})]
-  \]
-  then linear layers to produce a single logit.
+- **Per-plane encoder:** residual blocks + strided convolutions on 2D sparse tensors.
+- **Pooling:** global max pooling per plane.
+- **Fusion:** gated-logit fusion over the three planes.
+- **Classifier head:** linear head per plane to produce a single logit, then fused.
 
 ## Training loop
 
