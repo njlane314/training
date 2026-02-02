@@ -9,6 +9,11 @@ import MinkowskiEngine as ME
 
 
 class SparseLayerNorm(nn.Module):
+    """
+    Batch-size/occupancy agnostic normalization:
+    LayerNorm over channels per sparse site (point).
+    """
+
     def __init__(self, c: int, eps: float = 1e-6):
         super().__init__()
         self.ln = nn.LayerNorm(int(c), eps=eps)
@@ -49,6 +54,11 @@ class Down(nn.Sequential):
 
 
 class SparseResNet2D(nn.Module):
+    """
+    Minimal 2D sparse residual encoder -> global pooled embedding.
+    backbone(x) returns [B, D] (not logits), for late/set fusion.
+    """
+
     def __init__(self, in_ch: int, base: int, blocks: Tuple[int, ...], embed_dim: int):
         super().__init__()
         self.stem = nn.Sequential(
@@ -74,10 +84,11 @@ class SparseResNet2D(nn.Module):
             if li < len(self.downs):
                 x = self.downs[li](x)
         x = self.pool(x)
-        return self.proj(x.F)
+        return self.proj(x.F)  # [B,D]
 
 
 _PRESETS: Dict[str, Dict] = {
+    # (base channels, blocks per level); 512x512 -> 3 or 4 downs is typical
     "tiny": {"base": 16, "blocks": (1, 1, 1)},
     "small": {"base": 32, "blocks": (1, 1, 1, 1)},
     "base": {"base": 32, "blocks": (2, 2, 2, 2)},
@@ -86,6 +97,10 @@ _PRESETS: Dict[str, Dict] = {
 
 
 def make_backbone(name: str, in_ch: int, embed_dim: int) -> nn.Module:
+    """
+    Factory for quick backbone sweeps:
+      BACKBONE={tiny,small,base,wide}
+    """
     if name not in _PRESETS:
         raise ValueError(f"unknown BACKBONE={name!r}; choose from {sorted(_PRESETS)}")
     p = _PRESETS[name]

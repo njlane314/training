@@ -118,9 +118,7 @@ def train_llr():
                         )
                         for name in planes
                     }
-                    logits = model(
-                        inputs, available_mask=available_mask.to(device, non_blocking=True)
-                    ).squeeze(1)
+                    logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
                     tot += loss_fn(logits, y).item()
                     cnt += 1
             print(f"[val] step {step:7d}  loss {tot/max(cnt,1):.4f}")
