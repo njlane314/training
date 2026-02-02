@@ -128,3 +128,42 @@ def collate_me(batch):
     feats = torch.cat(feats_list, dim=0).contiguous()    # (sumN,3)
     y = torch.tensor(ys, dtype=torch.float32)
     return coords, feats, y
+
+
+def collate_me_fusion(batch, plane_names=("u", "v", "w")):
+    coords_by_plane = {name: [] for name in plane_names}
+    feats_by_plane = {name: [] for name in plane_names}
+    ys = []
+
+    batch_size = len(batch)
+    available_mask = torch.zeros((batch_size, len(plane_names)), dtype=torch.float32)
+
+    for bi, (c, f, y) in enumerate(batch):
+        c = torch.as_tensor(c, dtype=torch.int32).contiguous()   # (N,3): (plane,y,x)
+        f = torch.as_tensor(f, dtype=torch.float32).contiguous() # (N,3): (occ, logq, plane_id)
+        ys.append(y)
+
+        for pi, name in enumerate(plane_names):
+            mask = c[:, 0] == pi
+            if mask.any():
+                available_mask[bi, pi] = 1.0
+                c_plane = c[mask][:, 1:3]
+                f_plane = f[mask][:, 0:2]
+            else:
+                c_plane = torch.zeros((1, 2), dtype=torch.int32)
+                f_plane = torch.zeros((1, 2), dtype=torch.float32)
+
+            bcol = torch.full((c_plane.shape[0], 1), bi, dtype=torch.int32)
+            coords_by_plane[name].append(torch.cat([bcol, c_plane], dim=1))
+            feats_by_plane[name].append(f_plane)
+
+    coords = {
+        name: torch.cat(coords_by_plane[name], dim=0).contiguous()
+        for name in plane_names
+    }
+    feats = {
+        name: torch.cat(feats_by_plane[name], dim=0).contiguous()
+        for name in plane_names
+    }
+    y = torch.tensor(ys, dtype=torch.float32)
+    return coords, feats, y, available_mask

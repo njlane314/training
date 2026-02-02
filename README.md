@@ -1,6 +1,6 @@
 # Sparse MinkowskiEngine Training
 
-This repository trains a sparse 3D MinkowskiEngine U-Net classifier on DUNE-style wire-plane images stored in a ROOT file. The pipeline converts dense 2D detector images from three views (U/V/W) into sparse tensors, shards the data to disk, and then trains a binary classifier with balanced mini-batches.
+This repository trains a sparse MinkowskiEngine classifier on DUNE-style wire-plane images stored in a ROOT file. The pipeline converts dense 2D detector images from three views (U/V/W) into sparse tensors, shards the data to disk, and then trains a binary classifier with balanced mini-batches using per-plane 2D encoders and late-fusion logits.
 
 ## Quick start
 
@@ -20,8 +20,8 @@ If you need a full workflow script with environment variables, see [`workflow_up
 ## Project layout
 
 - `likelihood/data.py` — ROOT ingestion, sparse conversion, sharding, and datasets.
-- `likelihood/model.py` — MinkowskiEngine U-Net classifier.
-- `likelihood/train.py` — training loop with balanced batches and EMA metrics.
+- `likelihood/model.py` — 2D MinkowskiEngine encoder used per plane.
+- `likelihood/train.py` — training loop with balanced batches and gated-logit fusion.
 - `scripts/prepare.py` — shard creation entry point.
 - `scripts/overfit_check.py` — quick overfit diagnostic.
 
@@ -47,13 +47,10 @@ Two ADC encodings are supported (controlled by `ADC_SIGNLOG`):
   \]
   with indices where `|v| > THRESH`.
 
-Each sparse point stores a 3D coordinate and a 4D feature vector:
+Each sparse point stores a 3D coordinate and a 3D feature vector:
 
 - **Coordinates:** `(view, y, x)` where `view ∈ {0,1,2}`.
-- **Features:** `(adc, y_norm, x_norm, view_norm)` with
-  \[
-  y_\text{norm} = \frac{y - H/2}{H/2},\quad x_\text{norm} = \frac{x - W/2}{W/2},\quad view_\text{norm} = view - 1.
-  \]
+- **Features:** `(occupancy, log_charge, view_id)` with `view_id ∈ {-1, 0, +1}`.
 
 ### 2) Sharding
 Events are grouped into shards on disk to keep training I/O predictable:
@@ -67,27 +64,23 @@ The training loader uses `BalancedBatchSampler` to build class-balanced batches 
 
 ## Model architecture
 
-`MinkUNetClassifier` is a sparse 3D U-Net with residual blocks and global pooling:
+Each plane uses a sparse 2D residual encoder with global max pooling:
 
-- **Input normalization:** learnable shift and log-scale per feature channel.
-- **Encoder:** repeated residual blocks + strided convolutions.
-- **Decoder:** transposed convolutions with skip connections.
-- **Pooling:** global sum + max pooling.
-- **Classifier head:** MLP on pooled features plus a `log1p` count feature:
-  \[
-  z = [\text{sum\_pool}(x),\ \text{max\_pool}(x),\ \log(1 + N_{\text{points}})]
-  \]
-  then linear layers to produce a single logit.
+- **Input features:** per-plane `(occupancy, log_charge)` only.
+- **Encoder:** repeated residual blocks + strided 2D convolutions.
+- **Pooling:** global max pooling.
+- **Classifier head:** linear projection to a single logit.
+
+The three per-plane logits are combined with `LateFusionClassifier` using `fusion="gated_logits"`, which learns sample-dependent weights and respects the per-plane availability mask.
 
 ## Training loop
 
 Training (`likelihood/train.py`) uses:
 
 - **Loss:** `BCEWithLogitsLoss` on the binary labels.
-- **Optimizer:** `AdamW`.
-- **LR schedule:** none (flat learning rate).
-- **Validation:** a random probe batch from the validation set each step to track EMA of loss.
-- **Checkpoint:** best EMA validation loss (`checkpoint.pt` by default).
+- **Optimizer:** `SGD` with momentum.
+- **LR schedule:** polynomial decay.
+- **Validation:** fixed number of validation batches every `VAL_EVERY` steps.
 
 ## Troubleshooting: training stuck near chance
 
