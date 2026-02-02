@@ -7,36 +7,21 @@ import numpy as np
 import torch
 import uproot
 
-# -------------------------
-# Edit these few constants
-# -------------------------
-ROOT_FILE = "your_file.root"
-TREE = "your_tree"
+from . import config as cfg
 
-BR_U = "detector_image_u"
-BR_V = "detector_image_v"
-BR_W = "detector_image_w"
-BR_Y = "is_signal"     # 0/1
-BR_WGT = "w_nominal"   # float
-
-H, W = 512, 512
-THRESH = 0.0           # pixels <= THRESH are dropped
-CHUNK_EVENTS = 512
-SHARD_EVENTS = 2048
-OUT_DIR = Path("shards")
 
 
 def plane_to_sparse(flat: np.ndarray, plane: int):
     flat = np.asarray(flat, dtype=np.float32).reshape(-1)
-    if flat.size != H * W:
-        raise ValueError(f"plane size {flat.size} != {H}*{W}")
+    if flat.size != cfg.H * cfg.W:
+        raise ValueError(f"plane size {flat.size} != {cfg.H}*{cfg.W}")
 
-    idx = np.flatnonzero(flat > THRESH)
+    idx = np.flatnonzero(flat > cfg.THRESH)
     if idx.size == 0:
         return None, None
 
     val = flat[idx]
-    y, x = np.divmod(idx.astype(np.int64), W)
+    y, x = np.divmod(idx.astype(np.int64), cfg.W)
 
     coords = np.empty((idx.size, 3), dtype=np.int32)
     coords[:, 0] = int(plane)
@@ -86,18 +71,19 @@ def pack_events(coords_list, feats_list):
 
 
 def write_shards_from_root():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for p in glob.glob(str(OUT_DIR / "shard_*.pt")):
+    out_dir = Path(cfg.PROCESS_OUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for p in glob.glob(str(out_dir / "shard_*.pt")):
         os.remove(p)
-    idx_path = OUT_DIR / "index.pt"
+    idx_path = out_dir / "index.pt"
     if idx_path.exists():
         idx_path.unlink()
 
-    with uproot.open(ROOT_FILE) as f:
-        t = f[TREE]
+    with uproot.open(cfg.ROOT_FILE) as f:
+        t = f[cfg.TREE]
 
-        labels = t[BR_Y].array(library="np").astype(np.uint8).reshape(-1)
-        weights = t[BR_WGT].array(library="np").astype(np.float32).reshape(-1)
+        labels = t[cfg.BR_Y].array(library="np").astype(np.uint8).reshape(-1)
+        weights = t[cfg.BR_WGT].array(library="np").astype(np.float32).reshape(-1)
         n_events = int(labels.shape[0])
 
         nnz = np.zeros(n_events, dtype=np.int32)
@@ -106,11 +92,11 @@ def write_shards_from_root():
         shard_start = 0
         coords_acc, feats_acc, y_acc = [], [], []
 
-        for start in range(0, n_events, CHUNK_EVENTS):
-            stop = min(start + CHUNK_EVENTS, n_events)
-            a = t.arrays([BR_U, BR_V, BR_W], entry_start=start, entry_stop=stop, library="np")
+        for start in range(0, n_events, cfg.CHUNK_EVENTS):
+            stop = min(start + cfg.CHUNK_EVENTS, n_events)
+            a = t.arrays([cfg.BR_U, cfg.BR_V, cfg.BR_W], entry_start=start, entry_stop=stop, library="np")
 
-            uu, vv, ww = a[BR_U], a[BR_V], a[BR_W]
+            uu, vv, ww = a[cfg.BR_U], a[cfg.BR_V], a[cfg.BR_W]
 
             for j in range(stop - start):
                 gi = start + j
@@ -121,7 +107,7 @@ def write_shards_from_root():
                 feats_acc.append(fe)
                 y_acc.append(int(labels[gi]))
 
-                if len(y_acc) == SHARD_EVENTS:
+                if len(y_acc) == cfg.SHARD_EVENTS:
                     coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
                     torch.save(
                         {
@@ -132,7 +118,7 @@ def write_shards_from_root():
                             "starts": starts_t,
                             "labels": torch.tensor(y_acc, dtype=torch.uint8),
                         },
-                        OUT_DIR / f"shard_{shard_id:05d}.pt",
+                        out_dir / f"shard_{shard_id:05d}.pt",
                     )
                     shard_id += 1
                     shard_start = gi + 1
@@ -151,22 +137,22 @@ def write_shards_from_root():
                     "starts": starts_t,
                     "labels": torch.tensor(y_acc, dtype=torch.uint8),
                 },
-                OUT_DIR / f"shard_{shard_id:05d}.pt",
+                out_dir / f"shard_{shard_id:05d}.pt",
             )
             shard_id += 1
 
         torch.save(
             {
-                "H": int(H),
-                "W": int(W),
-                "shard_events": int(SHARD_EVENTS),
+                "H": int(cfg.H),
+                "W": int(cfg.W),
+                "shard_events": int(cfg.SHARD_EVENTS),
                 "n_events": int(n_events),
                 "labels": torch.from_numpy(labels),
                 "weights": torch.from_numpy(weights),
                 "nnz": torch.from_numpy(nnz),
-                "branches": {"y": BR_Y, "u": BR_U, "v": BR_V, "w": BR_W, "wgt": BR_WGT},
+                "branches": {"y": cfg.BR_Y, "u": cfg.BR_U, "v": cfg.BR_V, "w": cfg.BR_W, "wgt": cfg.BR_WGT},
             },
             idx_path,
         )
 
-    print(f"wrote {shard_id} shards to {OUT_DIR} (events={n_events})")
+    print(f"wrote {shard_id} shards to {out_dir} (events={n_events})")
