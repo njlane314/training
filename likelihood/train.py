@@ -7,8 +7,8 @@ import MinkowskiEngine as ME
 
 from . import config as cfg
 from .dataset import BalancedBatchSampler, ShardDataset, collate_me_fusion
-from .fusion import LateFusionClassifier
-from .model import SparseUResNetEncoderClassifier
+from .fusion import MultiViewSetClassifier
+from .model import make_backbone
 
 def poly_lr(step, max_steps, lr0, power):
     t = min(step / max_steps, 1.0)
@@ -58,11 +58,8 @@ def train_llr():
     )
 
     planes = ("u", "v", "w")
-    models = {
-        name: SparseUResNetEncoderClassifier(in_ch=2, base=32).to(device)
-        for name in planes
-    }
-    model = LateFusionClassifier(models=models, num_classes=1).to(device)
+    backbone = make_backbone(cfg.BACKBONE, in_ch=2, embed_dim=cfg.EMBED_DIM).to(device)
+    model = MultiViewSetClassifier(backbone=backbone, embed_dim=cfg.EMBED_DIM, plane_names=planes).to(device)
     opt = torch.optim.SGD(
         model.parameters(),
         lr=cfg.LR0,

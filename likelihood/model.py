@@ -1,114 +1,92 @@
+from __future__ import annotations
+
+from typing import Dict, Tuple
+
+import torch
 import torch.nn as nn
 
 import MinkowskiEngine as ME
 
 
 class SparseLayerNorm(nn.Module):
-    """
-    LayerNorm applied to sparse features pointwise (no batch statistics).
-    """
-
-    def __init__(self, channels: int, eps: float = 1e-5):
+    def __init__(self, c: int, eps: float = 1e-6):
         super().__init__()
-        self.ln = nn.LayerNorm(int(channels), eps=eps)
+        self.ln = nn.LayerNorm(int(c), eps=eps)
 
     def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
         return x.replace_feature(self.ln(x.F))
 
 
-def _norm(channels: int) -> nn.Module:
-    """
-    Prefer InstanceNorm (stable for small batch sizes); fall back to LayerNorm.
-    """
-    if hasattr(ME, "MinkowskiInstanceNorm"):
-        return ME.MinkowskiInstanceNorm(int(channels))
-    return SparseLayerNorm(int(channels))
-
-
 class ResBlock(nn.Module):
-    def __init__(self, cin, cout):
+    def __init__(self, cin: int, cout: int):
         super().__init__()
-        self.conv1 = ME.MinkowskiSubmanifoldConvolution(
-            cin, cout, kernel_size=(3, 3), dimension=2, bias=False
-        )
-        self.n1 = _norm(cout)
-        self.conv2 = ME.MinkowskiSubmanifoldConvolution(
-            cout, cout, kernel_size=(3, 3), dimension=2, bias=False
-        )
-        self.n2 = _norm(cout)
-        self.relu = ME.MinkowskiReLU(inplace=True)
-
+        self.conv1 = ME.MinkowskiSubmanifoldConvolution(cin, cout, kernel_size=3, dimension=2, bias=False)
+        self.n1 = SparseLayerNorm(cout)
+        self.conv2 = ME.MinkowskiSubmanifoldConvolution(cout, cout, kernel_size=3, dimension=2, bias=False)
+        self.n2 = SparseLayerNorm(cout)
+        self.act = ME.MinkowskiReLU(inplace=True)
         self.proj = None
         if cin != cout:
             self.proj = nn.Sequential(
                 ME.MinkowskiLinear(cin, cout, bias=False),
-                _norm(cout),
+                SparseLayerNorm(cout),
             )
 
-    def forward(self, x):
+    def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
         identity = x if self.proj is None else self.proj(x)
-        out = self.relu(self.n1(self.conv1(x)))
+        out = self.act(self.n1(self.conv1(x)))
         out = self.n2(self.conv2(out))
-        out = self.relu(out + identity)
-        return out
+        return self.act(out + identity)
 
 
-class SparseUResNetEncoderClassifier(nn.Module):
-    """
-    2D residual encoder + global max pooling head for per-plane logits.
-    Input coords: (batch, y, x) with D=2 spatial dims.
-    """
-
-    def __init__(self, in_ch=2, base=32):
-        super().__init__()
-
-        self.stem = nn.Sequential(
-            ME.MinkowskiSubmanifoldConvolution(
-                in_ch, base, kernel_size=(3, 3), dimension=2, bias=False
-            ),
-            _norm(base),
+class Down(nn.Sequential):
+    def __init__(self, cin: int, cout: int):
+        super().__init__(
+            ME.MinkowskiConvolution(cin, cout, kernel_size=2, stride=2, dimension=2, bias=False),
+            SparseLayerNorm(cout),
             ME.MinkowskiReLU(inplace=True),
         )
 
-        self.b0 = ResBlock(base, base)
-        self.down1 = ME.MinkowskiConvolution(
-            base,
-            base * 2,
-            kernel_size=(2, 2),
-            stride=(2, 2),
-            dimension=2,
-            bias=False,
-        )
-        self.b1 = ResBlock(base * 2, base * 2)
 
-        self.down2 = ME.MinkowskiConvolution(
-            base * 2,
-            base * 4,
-            kernel_size=(2, 2),
-            stride=(2, 2),
-            dimension=2,
-            bias=False,
+class SparseResNet2D(nn.Module):
+    def __init__(self, in_ch: int, base: int, blocks: Tuple[int, ...], embed_dim: int):
+        super().__init__()
+        self.stem = nn.Sequential(
+            ME.MinkowskiSubmanifoldConvolution(in_ch, base, kernel_size=3, dimension=2, bias=False),
+            SparseLayerNorm(base),
+            ME.MinkowskiReLU(inplace=True),
         )
-        self.b2 = ResBlock(base * 4, base * 4)
-
-        self.down3 = ME.MinkowskiConvolution(
-            base * 4,
-            base * 8,
-            kernel_size=(2, 2),
-            stride=(2, 2),
-            dimension=2,
-            bias=False,
-        )
-        self.b3 = ResBlock(base * 8, base * 8)
-
+        self.blocks = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        ch = int(base)
+        for li, nb in enumerate(blocks):
+            self.blocks.append(nn.Sequential(*[ResBlock(ch, ch) for _ in range(int(nb))]))
+            if li < len(blocks) - 1:
+                self.downs.append(Down(ch, ch * 2))
+                ch *= 2
         self.pool = ME.MinkowskiGlobalMaxPooling()
-        self.head = nn.Linear(base * 8, 1)
+        self.proj = nn.Linear(ch, int(embed_dim))
 
-    def forward(self, x: ME.SparseTensor):
+    def forward(self, x: ME.SparseTensor) -> torch.Tensor:
         x = self.stem(x)
-        x = self.b0(x)
-        x = self.b1(self.down1(x))
-        x = self.b2(self.down2(x))
-        x = self.b3(self.down3(x))
-        x = self.pool(x)  # one feature vector per batch item
-        return self.head(x.F)  # logits [B, 1]
+        for li, blk in enumerate(self.blocks):
+            x = blk(x)
+            if li < len(self.downs):
+                x = self.downs[li](x)
+        x = self.pool(x)
+        return self.proj(x.F)
+
+
+_PRESETS: Dict[str, Dict] = {
+    "tiny": {"base": 16, "blocks": (1, 1, 1)},
+    "small": {"base": 32, "blocks": (1, 1, 1, 1)},
+    "base": {"base": 32, "blocks": (2, 2, 2, 2)},
+    "wide": {"base": 48, "blocks": (2, 2, 2, 2)},
+}
+
+
+def make_backbone(name: str, in_ch: int, embed_dim: int) -> nn.Module:
+    if name not in _PRESETS:
+        raise ValueError(f"unknown BACKBONE={name!r}; choose from {sorted(_PRESETS)}")
+    p = _PRESETS[name]
+    return SparseResNet2D(in_ch=int(in_ch), base=int(p["base"]), blocks=tuple(p["blocks"]), embed_dim=int(embed_dim))
