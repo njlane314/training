@@ -71,7 +71,7 @@ Each plane uses a sparse 2D residual encoder with global max pooling:
 - **Pooling:** global max pooling.
 - **Classifier head:** linear projection to a single logit.
 
-The three per-plane logits are combined with `LateFusionClassifier` using product-of-experts fusion, summing available logits (with a small calibration head) based on the per-plane availability mask.
+The three per-plane logits are combined with `MultiViewSetClassifier` using product-of-experts fusion, summing available logits (with a small calibration head) based on the per-plane availability mask.
 
 ## Training loop
 
