@@ -76,6 +76,14 @@ def write_shards_from_root():
     if idx_path.exists():
         idx_path.unlink()
 
+    def render_progress(current: int, total: int, width: int = 40) -> None:
+        if total <= 0:
+            return
+        ratio = min(max(current / total, 0.0), 1.0)
+        filled = int(ratio * width)
+        bar = "=" * filled + "-" * (width - filled)
+        print(f"\rProcessing events: |{bar}| {current}/{total}", end="", flush=True)
+
     with uproot.open(cfg.ROOT_FILE) as f:
         t = f[cfg.TREE]
 
@@ -89,6 +97,9 @@ def write_shards_from_root():
         shard_start = 0
         coords_acc, feats_acc = [], []
         n_acc = 0
+
+        progress_every = max(1, n_events // 200)
+        render_progress(0, n_events)
 
         for start in range(0, n_events, cfg.CHUNK_EVENTS):
             stop = min(start + cfg.CHUNK_EVENTS, n_events)
@@ -123,6 +134,9 @@ def write_shards_from_root():
                     feats_acc.clear()
                     n_acc = 0
 
+                if (gi + 1) % progress_every == 0 or (gi + 1) == n_events:
+                    render_progress(gi + 1, n_events)
+
         if n_acc:
             coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
             torch.save(
@@ -151,4 +165,5 @@ def write_shards_from_root():
             idx_path,
         )
 
+    print()
     print(f"wrote {shard_id} shards to {out_dir} (events={n_events})")
