@@ -31,7 +31,7 @@ class ResBlock(nn.Module):
         return out
 
 
-class SparseUResNetEncoderClassifier(nn.Module):
+class UResNetClassifier(nn.Module):
     """
     UResNet-style residual encoder + global pooling head for event-level LLR.
     Input coords: (batch, plane, y, x) with D=3 spatial dims (plane,y,x).
