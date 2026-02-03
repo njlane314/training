@@ -1,8 +1,11 @@
-# make_shards.py
-import glob
+from __future__ import annotations
+
+import gc
 import os
 import time
+import warnings
 from pathlib import Path
+from typing import Iterable, Tuple
 
 import numpy as np
 import torch
@@ -12,6 +15,11 @@ from . import config as cfg
 
 _DUMMY_COORDS = np.array([[0, 0, 0]], dtype=np.int32)
 _DUMMY_FEATS = np.array([[0.0, 0.0]], dtype=np.float16)
+
+def _atomic_torch_save(obj, path: Path) -> None:
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    torch.save(obj, tmp)
+    tmp.replace(path)
 
 def plane_to_sparse(
     flat: np.ndarray,
@@ -46,14 +54,21 @@ def plane_to_sparse(
     return coords, feats
 
 
-def event_to_sparse(u, v, w, *, width: int = cfg.W):
-    iu = np.flatnonzero(u > cfg.THRESH)
-    iv = np.flatnonzero(v > cfg.THRESH)
-    iw = np.flatnonzero(w > cfg.THRESH)
+def event_to_sparse(
+    u: np.ndarray,
+    v: np.ndarray,
+    w: np.ndarray,
+    *,
+    width: int,
+    thresh: float,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    iu = np.flatnonzero(u > thresh)
+    iv = np.flatnonzero(v > thresh)
+    iw = np.flatnonzero(w > thresh)
 
     total = iu.size + iv.size + iw.size
     if total == 0:
-        return _DUMMY_COORDS, _DUMMY_FEATS
+        return _DUMMY_COORDS, _DUMMY_FEATS, 0
 
     coords = np.empty((total, 3), dtype=np.int32)
     feats = np.empty((total, 2), dtype=np.float16)
@@ -77,17 +92,27 @@ def event_to_sparse(u, v, w, *, width: int = cfg.W):
 
         off += n
 
-    return coords, feats
+    return coords, feats, int(total)
 
 
-def pack_events(coords_list, feats_list):
-    lengths = np.fromiter((c.shape[0] for c in coords_list), dtype=np.int64, count=len(coords_list))
+def pack_events(coords_list: Iterable[np.ndarray], feats_list: Iterable[np.ndarray]):
+    coords_list = list(coords_list)
+    feats_list = list(feats_list)
+    n_events = len(coords_list)
+    lengths = np.fromiter((c.shape[0] for c in coords_list), dtype=np.int64, count=n_events)
     starts = np.empty(len(lengths) + 1, dtype=np.int64)
     starts[0] = 0
     np.cumsum(lengths, out=starts[1:])
 
-    coords = np.concatenate(coords_list, axis=0)
-    feats = np.concatenate(feats_list, axis=0)
+    total = int(starts[-1])
+    coords = np.empty((total, 3), dtype=np.int32)
+    feats = np.empty((total, 2), dtype=np.float16)
+    off = 0
+    for c, f in zip(coords_list, feats_list):
+        n = int(c.shape[0])
+        coords[off : off + n] = c
+        feats[off : off + n] = f
+        off += n
 
     return (
         torch.from_numpy(coords),
@@ -95,12 +120,126 @@ def pack_events(coords_list, feats_list):
         torch.from_numpy(starts),
     )
 
+def _infer_hw_from_any(raw: np.ndarray, *, fallback_h: int, fallback_w: int) -> Tuple[int, int]:
+    try:
+        arr = np.asarray(raw)
+    except Exception:
+        return int(fallback_h), int(fallback_w)
+
+    if arr.dtype != object:
+        if arr.ndim >= 3:
+            return int(arr.shape[-2]), int(arr.shape[-1])
+        if arr.ndim == 2:
+            if arr.shape[0] == fallback_h and arr.shape[1] == fallback_w:
+                return int(fallback_h), int(fallback_w)
+            hw = int(arr.shape[1])
+            side = int(np.sqrt(hw))
+            if side * side == hw:
+                return side, side
+            return int(fallback_h), int(fallback_w)
+        if arr.ndim == 1:
+            hw = int(arr.size)
+            if hw == fallback_h * fallback_w:
+                return int(fallback_h), int(fallback_w)
+            side = int(np.sqrt(hw))
+            if side * side == hw:
+                return side, side
+            return int(fallback_h), int(fallback_w)
+
+    if arr.dtype == object and arr.ndim >= 1 and arr.shape[0] > 0:
+        for item in arr:
+            if item is None:
+                continue
+            try:
+                x = np.asarray(item)
+            except Exception:
+                continue
+            if x.ndim >= 2:
+                return int(x.shape[-2]), int(x.shape[-1])
+            hw = int(x.size)
+            if hw == fallback_h * fallback_w:
+                return int(fallback_h), int(fallback_w)
+            side = int(np.sqrt(hw))
+            if side * side == hw:
+                return side, side
+            break
+
+    return int(fallback_h), int(fallback_w)
+
+def _flatten_plane_batch(
+    raw: np.ndarray,
+    *,
+    h: int,
+    w: int,
+    name: str,
+    strict: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    hw = int(h) * int(w)
+
+    arr = np.asarray(raw)
+
+    if arr.dtype != object:
+        if arr.ndim == 3 and arr.shape[-2:] == (h, w):
+            flat = arr.reshape(arr.shape[0], hw).astype(np.float32, copy=False)
+            return flat, np.zeros(flat.shape[0], dtype=bool)
+        if arr.ndim == 2:
+            if arr.shape[1] == hw:
+                flat = arr.astype(np.float32, copy=False)
+                return flat, np.zeros(flat.shape[0], dtype=bool)
+            if arr.shape == (h, w):
+                flat = arr.reshape(1, hw).astype(np.float32, copy=False)
+                return flat, np.zeros(1, dtype=bool)
+        if arr.ndim == 1 and arr.size == hw:
+            flat = arr.reshape(1, hw).astype(np.float32, copy=False)
+            return flat, np.zeros(1, dtype=bool)
+
+    if arr.dtype == object:
+        try:
+            stacked = np.stack(arr)
+        except Exception:
+            stacked = None
+        if stacked is not None and stacked.dtype != object:
+            return _flatten_plane_batch(stacked, h=h, w=w, name=name, strict=strict)
+
+    if arr.ndim == 0:
+        msg = f"{name} has unexpected scalar shape {arr.shape}"
+        if strict:
+            raise ValueError(msg)
+        warnings.warn(msg)
+        return np.zeros((0, hw), dtype=np.float32), np.zeros((0,), dtype=bool)
+
+    n = int(arr.shape[0])
+    out = np.zeros((n, hw), dtype=np.float32)
+    bad = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        item = arr[i]
+        if item is None:
+            bad[i] = True
+            continue
+        try:
+            x = np.asarray(item)
+        except Exception:
+            bad[i] = True
+            continue
+        if x.size != hw:
+            msg = f"{name}[{i}] has size {x.size} != {hw} (H*W)"
+            if strict:
+                raise ValueError(msg)
+            bad[i] = True
+            continue
+        out[i] = x.reshape(-1).astype(np.float32, copy=False)
+
+    return out, bad
+
 
 def write_shards_from_root():
     out_dir = Path(cfg.SHARDS_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for p in glob.glob(str(out_dir / "shard_*.pt")):
-        os.remove(p)
+    for p in out_dir.glob("shard_*.pt"):
+        p.unlink(missing_ok=True)
+    for p in out_dir.glob(".shard_*.pt.tmp.*"):
+        p.unlink(missing_ok=True)
     idx_path = out_dir / "index.pt"
     if idx_path.exists():
         idx_path.unlink()
@@ -128,31 +267,6 @@ def write_shards_from_root():
             eta = "--:--:--"
         print(f"\rProcessing events: |{bar}| {current}/{total} ETA {eta}", end="", flush=True)
 
-    def infer_hw(arr: np.ndarray, *, name: str):
-        arr = np.asarray(arr)
-        if arr.dtype == object:
-            try:
-                arr = np.stack(arr)
-            except ValueError:
-                arr = np.asarray([np.asarray(item).ravel() for item in arr])
-        if arr.ndim >= 3:
-            h, w = arr.shape[-2], arr.shape[-1]
-            return arr.reshape(arr.shape[0], h * w), int(h), int(w)
-        if arr.ndim == 2:
-            flat = arr
-        elif arr.ndim == 1:
-            flat = arr.reshape(1, -1)
-        else:
-            raise ValueError(f"{name} has unexpected shape {arr.shape}")
-
-        size = int(flat.shape[1])
-        if size == cfg.H * cfg.W:
-            return flat, int(cfg.H), int(cfg.W)
-        side = int(np.sqrt(size))
-        if side * side != size:
-            raise ValueError(f"{name} plane size {size} is not square and doesn't match H*W={cfg.H * cfg.W}")
-        return flat, side, side
-
     with uproot.open(cfg.ROOT_FILE) as f:
         t = f[cfg.TREE]
 
@@ -161,6 +275,8 @@ def write_shards_from_root():
         weights = np.empty(n_events, dtype=np.float32)
 
         nnz = np.zeros(n_events, dtype=np.int32)
+        bad_events: list[int] = []
+        bad_logged = 0
 
         shard_id = 0
         shard_start = 0
@@ -169,6 +285,10 @@ def write_shards_from_root():
 
         progress_every = max(1, n_events // 200)
         render_progress(0, n_events)
+
+        h = int(cfg.H)
+        w = int(cfg.W)
+        thresh = float(cfg.THRESH)
 
         for start in range(0, n_events, cfg.CHUNK_EVENTS):
             stop = min(start + cfg.CHUNK_EVENTS, n_events)
@@ -180,25 +300,66 @@ def write_shards_from_root():
             )
 
             uu_raw, vv_raw, ww_raw = a[cfg.BR_U], a[cfg.BR_V], a[cfg.BR_W]
-            labels[start:stop] = a[cfg.BR_Y].astype(np.uint8, copy=False).reshape(-1)
-            weights[start:stop] = a[cfg.BR_WGT].astype(np.float32, copy=False).reshape(-1)
+            if start == 0:
+                hu, wu = _infer_hw_from_any(uu_raw, fallback_h=h, fallback_w=w)
+                hv, wv = _infer_hw_from_any(vv_raw, fallback_h=h, fallback_w=w)
+                hw_, ww_ = _infer_hw_from_any(ww_raw, fallback_h=h, fallback_w=w)
+                if (hu, wu) == (hv, wv) == (hw_, ww_) and (hu, wu) != (h, w):
+                    warnings.warn(
+                        f"cfg.H/cfg.W={h}x{w} do not match data={hu}x{wu}; "
+                        f"using inferred H/W from file"
+                    )
+                    h, w = int(hu), int(wu)
 
-            uu, h, w = infer_hw(uu_raw, name=cfg.BR_U)
-            vv, h_v, w_v = infer_hw(vv_raw, name=cfg.BR_V)
-            ww, h_w, w_w = infer_hw(ww_raw, name=cfg.BR_W)
-            if (h, w) != (h_v, w_v) or (h, w) != (h_w, w_w):
-                raise ValueError(
-                    f"plane sizes differ: u={h}x{w}, v={h_v}x{w_v}, w={h_w}x{w_w}"
-                )
+            y = np.asarray(a[cfg.BR_Y]).reshape(-1)
+            if y.size != (stop - start):
+                msg = f"{cfg.BR_Y} batch has size {y.size} != {stop-start}; zero-filling"
+                if cfg.STRICT_SHAPES:
+                    raise ValueError(msg)
+                if bad_logged < cfg.MAX_BAD_EVENT_LOG:
+                    warnings.warn(msg)
+                y = np.zeros(stop - start, dtype=np.uint8)
+            labels[start:stop] = y.astype(np.uint8, copy=False)
 
-            uu = uu.astype(np.float32, copy=False)
-            vv = vv.astype(np.float32, copy=False)
-            ww = ww.astype(np.float32, copy=False)
+            wgt = np.asarray(a[cfg.BR_WGT]).reshape(-1)
+            if wgt.size != (stop - start):
+                msg = f"{cfg.BR_WGT} batch has size {wgt.size} != {stop-start}; one-filling"
+                if cfg.STRICT_SHAPES:
+                    raise ValueError(msg)
+                if bad_logged < cfg.MAX_BAD_EVENT_LOG:
+                    warnings.warn(msg)
+                wgt = np.ones(stop - start, dtype=np.float32)
+            weights[start:stop] = wgt.astype(np.float32, copy=False)
+
+            uu, bad_u = _flatten_plane_batch(
+                uu_raw, h=h, w=w, name=cfg.BR_U, strict=cfg.STRICT_SHAPES
+            )
+            vv, bad_v = _flatten_plane_batch(
+                vv_raw, h=h, w=w, name=cfg.BR_V, strict=cfg.STRICT_SHAPES
+            )
+            ww, bad_w = _flatten_plane_batch(
+                ww_raw, h=h, w=w, name=cfg.BR_W, strict=cfg.STRICT_SHAPES
+            )
+            bad_batch = bad_u | bad_v | bad_w
 
             for j in range(stop - start):
                 gi = start + j
-                c, fe = event_to_sparse(uu[j], vv[j], ww[j], width=w)
-                nnz[gi] = int(c.shape[0])
+                try:
+                    c, fe, nnz_true = event_to_sparse(
+                        uu[j], vv[j], ww[j], width=w, thresh=thresh
+                    )
+                except Exception as e:
+                    if cfg.STRICT_SHAPES:
+                        raise
+                    c, fe, nnz_true = _DUMMY_COORDS, _DUMMY_FEATS, 0
+                    bad_batch[j] = True
+                    if bad_logged < cfg.MAX_BAD_EVENT_LOG:
+                        warnings.warn(f"event {gi}: event_to_sparse failed ({type(e).__name__}: {e}); zero-filling")
+                        bad_logged += 1
+
+                nnz[gi] = int(nnz_true)
+                if bad_batch[j]:
+                    bad_events.append(int(gi))
 
                 coords_acc.append(c)
                 feats_acc.append(fe)
@@ -206,7 +367,7 @@ def write_shards_from_root():
 
                 if n_acc == cfg.SHARD_EVENTS:
                     coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
-                    torch.save(
+                    _atomic_torch_save(
                         {
                             "start_event": int(shard_start),
                             "n_events": int(n_acc),
@@ -221,13 +382,14 @@ def write_shards_from_root():
                     coords_acc.clear()
                     feats_acc.clear()
                     n_acc = 0
+                    gc.collect()
 
                 if (gi + 1) % progress_every == 0 or (gi + 1) == n_events:
                     render_progress(gi + 1, n_events)
 
         if n_acc:
             coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
-            torch.save(
+            _atomic_torch_save(
                 {
                     "start_event": int(shard_start),
                     "n_events": int(n_acc),
@@ -239,7 +401,7 @@ def write_shards_from_root():
             )
             shard_id += 1
 
-        torch.save(
+        _atomic_torch_save(
             {
                 "H": int(h),
                 "W": int(w),
@@ -248,6 +410,7 @@ def write_shards_from_root():
                 "labels": torch.from_numpy(labels),
                 "weights": torch.from_numpy(weights),
                 "nnz": torch.from_numpy(nnz),
+                "bad_events": torch.tensor(bad_events, dtype=torch.int64),
                 "branches": {"y": cfg.BR_Y, "u": cfg.BR_U, "v": cfg.BR_V, "w": cfg.BR_W, "wgt": cfg.BR_WGT},
             },
             idx_path,
@@ -255,3 +418,5 @@ def write_shards_from_root():
 
     print()
     print(f"wrote {shard_id} shards to {out_dir} (events={n_events})")
+    if bad_events:
+        print(f"warning: {len(bad_events)} events had missing/malformed data and were zero-filled (see index.pt: bad_events)")

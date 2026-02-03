@@ -15,6 +15,7 @@ BR_V = os.environ.get("BR_V", "detector_image_v")
 BR_W = os.environ.get("BR_W", "detector_image_w")
 BR_Y = os.environ.get("BR_Y", "is_signal")
 BR_WGT = os.environ.get("BR_WGT", "w_nominal")
+STRICT_SHAPES = bool(int(os.environ.get("STRICT_SHAPES", "0")))
 
 H = _env("H", 512, int)
 W = _env("W", 512, int)
@@ -25,7 +26,8 @@ THRESH = _env("THRESH", 0.0, float)
 BACKBONE = os.environ.get("BACKBONE", "small")   # {tiny, small, base, wide}
 EMBED_DIM = _env("EMBED_DIM", 256, int)
 SHARD_EVENTS = _env("SHARD_EVENTS", 2048, int)
-CHUNK_EVENTS = _env("CHUNK_EVENTS", 64, int)
+CHUNK_EVENTS = _env("CHUNK_EVENTS", 256, int)
+MAX_BAD_EVENT_LOG = _env("MAX_BAD_EVENT_LOG", 25, int)
 
 # One canonical shards directory (used by both processing + training)
 SHARDS_DIR = os.environ.get("SHARDS_DIR", os.environ.get("PROCESS_OUT_DIR", "shards"))
