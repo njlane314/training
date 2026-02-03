@@ -130,6 +130,11 @@ def write_shards_from_root():
 
     def infer_hw(arr: np.ndarray, *, name: str):
         arr = np.asarray(arr)
+        if arr.dtype == object:
+            try:
+                arr = np.stack(arr)
+            except ValueError:
+                arr = np.asarray([np.asarray(item).ravel() for item in arr])
         if arr.ndim >= 3:
             h, w = arr.shape[-2], arr.shape[-1]
             return arr.reshape(arr.shape[0], h * w), int(h), int(w)
