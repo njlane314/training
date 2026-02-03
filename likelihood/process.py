@@ -46,7 +46,7 @@ def plane_to_sparse(
     return coords, feats
 
 
-def event_to_sparse(u, v, w):
+def event_to_sparse(u, v, w, *, width: int = cfg.W):
     iu = np.flatnonzero(u > cfg.THRESH)
     iv = np.flatnonzero(v > cfg.THRESH)
     iw = np.flatnonzero(w > cfg.THRESH)
@@ -66,8 +66,8 @@ def event_to_sparse(u, v, w):
 
         sl = slice(off, off + n)
         coords[sl, 0] = plane
-        np.floor_divide(idx, cfg.W, out=coords[sl, 1], casting="unsafe")
-        np.remainder(idx, cfg.W, out=coords[sl, 2], casting="unsafe")
+        np.floor_divide(idx, width, out=coords[sl, 1], casting="unsafe")
+        np.remainder(idx, width, out=coords[sl, 2], casting="unsafe")
 
         feats[sl, 0] = 1.0
         vals = arr[idx]
@@ -128,6 +128,26 @@ def write_shards_from_root():
             eta = "--:--:--"
         print(f"\rProcessing events: |{bar}| {current}/{total} ETA {eta}", end="", flush=True)
 
+    def infer_hw(arr: np.ndarray, *, name: str):
+        arr = np.asarray(arr)
+        if arr.ndim >= 3:
+            h, w = arr.shape[-2], arr.shape[-1]
+            return arr.reshape(arr.shape[0], h * w), int(h), int(w)
+        if arr.ndim == 2:
+            flat = arr
+        elif arr.ndim == 1:
+            flat = arr.reshape(1, -1)
+        else:
+            raise ValueError(f"{name} has unexpected shape {arr.shape}")
+
+        size = int(flat.shape[1])
+        if size == cfg.H * cfg.W:
+            return flat, int(cfg.H), int(cfg.W)
+        side = int(np.sqrt(size))
+        if side * side != size:
+            raise ValueError(f"{name} plane size {size} is not square and doesn't match H*W={cfg.H * cfg.W}")
+        return flat, side, side
+
     with uproot.open(cfg.ROOT_FILE) as f:
         t = f[cfg.TREE]
 
@@ -154,17 +174,25 @@ def write_shards_from_root():
                 library="np",
             )
 
-            uu, vv, ww = a[cfg.BR_U], a[cfg.BR_V], a[cfg.BR_W]
+            uu_raw, vv_raw, ww_raw = a[cfg.BR_U], a[cfg.BR_V], a[cfg.BR_W]
             labels[start:stop] = a[cfg.BR_Y].astype(np.uint8, copy=False).reshape(-1)
             weights[start:stop] = a[cfg.BR_WGT].astype(np.float32, copy=False).reshape(-1)
 
-            uu = uu.reshape(-1, cfg.H * cfg.W).astype(np.float32, copy=False)
-            vv = vv.reshape(-1, cfg.H * cfg.W).astype(np.float32, copy=False)
-            ww = ww.reshape(-1, cfg.H * cfg.W).astype(np.float32, copy=False)
+            uu, h, w = infer_hw(uu_raw, name=cfg.BR_U)
+            vv, h_v, w_v = infer_hw(vv_raw, name=cfg.BR_V)
+            ww, h_w, w_w = infer_hw(ww_raw, name=cfg.BR_W)
+            if (h, w) != (h_v, w_v) or (h, w) != (h_w, w_w):
+                raise ValueError(
+                    f"plane sizes differ: u={h}x{w}, v={h_v}x{w_v}, w={h_w}x{w_w}"
+                )
+
+            uu = uu.astype(np.float32, copy=False)
+            vv = vv.astype(np.float32, copy=False)
+            ww = ww.astype(np.float32, copy=False)
 
             for j in range(stop - start):
                 gi = start + j
-                c, fe = event_to_sparse(uu[j], vv[j], ww[j])
+                c, fe = event_to_sparse(uu[j], vv[j], ww[j], width=w)
                 nnz[gi] = int(c.shape[0])
 
                 coords_acc.append(c)
@@ -208,8 +236,8 @@ def write_shards_from_root():
 
         torch.save(
             {
-                "H": int(cfg.H),
-                "W": int(cfg.W),
+                "H": int(h),
+                "W": int(w),
                 "shard_events": int(cfg.SHARD_EVENTS),
                 "n_events": int(n_events),
                 "labels": torch.from_numpy(labels),
