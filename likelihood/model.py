@@ -8,6 +8,42 @@ import torch.nn as nn
 import MinkowskiEngine as ME
 
 
+def _subm_conv(
+    in_ch: int,
+    out_ch: int,
+    *,
+    kernel_size: int,
+    dimension: int,
+    bias: bool = False,
+) -> nn.Module:
+    """
+    Compatibility wrapper for submanifold sparse convolution.
+
+    Some MinkowskiEngine builds don't expose `MinkowskiSubmanifoldConvolution`.
+    The equivalent behavior is `MinkowskiConvolution(..., expand_coordinates=False)`
+    (which is the default in many versions, but we try to pass it explicitly).
+    """
+    if hasattr(ME, "MinkowskiSubmanifoldConvolution"):
+        return ME.MinkowskiSubmanifoldConvolution(
+            int(in_ch), int(out_ch), kernel_size=kernel_size, dimension=dimension, bias=bias
+        )
+    try:
+        return ME.MinkowskiConvolution(
+            int(in_ch),
+            int(out_ch),
+            kernel_size=kernel_size,
+            stride=1,
+            dimension=dimension,
+            bias=bias,
+            expand_coordinates=False,
+        )
+    except TypeError:
+        # Older ME builds may not accept `expand_coordinates`.
+        return ME.MinkowskiConvolution(
+            int(in_ch), int(out_ch), kernel_size=kernel_size, stride=1, dimension=dimension, bias=bias
+        )
+
+
 class SparseLayerNorm(nn.Module):
     """
     Batch-size/occupancy agnostic normalization:
@@ -25,9 +61,9 @@ class SparseLayerNorm(nn.Module):
 class ResBlock(nn.Module):
     def __init__(self, cin: int, cout: int):
         super().__init__()
-        self.conv1 = ME.MinkowskiSubmanifoldConvolution(cin, cout, kernel_size=3, dimension=2, bias=False)
+        self.conv1 = _subm_conv(cin, cout, kernel_size=3, dimension=2, bias=False)
         self.n1 = SparseLayerNorm(cout)
-        self.conv2 = ME.MinkowskiSubmanifoldConvolution(cout, cout, kernel_size=3, dimension=2, bias=False)
+        self.conv2 = _subm_conv(cout, cout, kernel_size=3, dimension=2, bias=False)
         self.n2 = SparseLayerNorm(cout)
         self.act = ME.MinkowskiReLU(inplace=True)
         self.proj = None
@@ -62,7 +98,7 @@ class SparseResNet2D(nn.Module):
     def __init__(self, in_ch: int, base: int, blocks: Tuple[int, ...], embed_dim: int):
         super().__init__()
         self.stem = nn.Sequential(
-            ME.MinkowskiSubmanifoldConvolution(in_ch, base, kernel_size=3, dimension=2, bias=False),
+            _subm_conv(in_ch, base, kernel_size=3, dimension=2, bias=False),
             SparseLayerNorm(base),
             ME.MinkowskiReLU(inplace=True),
         )
