@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
-llr_path.py
+llr_consistency_plot.py
 
-Train with periodic checkpoints + diagnose whether logits behave like an LLR surrogate.
+Make the LLR self-consistency plot from checkpoints produced by your train.py.
 
-Diagnostics per checkpoint on a fixed held-out (val) split:
-  1) Weighted, class-conditional ROC AUC (pairs drawn with prob ∝ w_nominal within each class).
-  2) "LLR in score space": r(z) = log p_s(z) / p_b(z) estimated from weighted histograms,
-     compared to the identity line r(z) = z.
+For each selected checkpoint:
+  - run inference on a fixed held-out validation split (constructed deterministically
+    from SHARDS_DIR/index.pt using SEED and VAL_FRACTION, matching your train.py split logic)
+  - collect logits z, labels y, and nominal weights w_nominal
+  - estimate (weighted) class-conditional 1D distributions in score space:
+        p_s(z), p_b(z)
+    via weighted histograms
+  - compute
+        r(z) = log p_s(z) - log p_b(z)
+  - plot r(z) vs z and overlay the identity line y=x
 
 Outputs (in --out-dir):
-  - metrics.csv
   - llr_consistency.png
-  - auc_vs_step.png
-  - alpha_beta_mse_vs_step.png
+  - metrics.csv  (per-checkpoint: slope/intercept of r vs z, MSE of r-z, etc.)
 
-Assumptions:
-  - This file lives next to config.py, dataset.py, model.py, fusion.py (same directory),
-    OR inside the same package (relative imports fallback).
-  - SHARDS_DIR contains index.pt + shard_XXXXX.pt as produced by process.py.
+Usage:
+  python llr_consistency_plot.py --ckpt-base checkpoints/ckpt.pt --out-dir llr_diag
+  python llr_consistency_plot.py --ckpt-glob "checkpoints/ckpt_step*.pt" --plot-count 8
 
-Run:
-  python llr_path.py train   --ckpt-dir checkpoints
-  python llr_path.py analyze --ckpt-dir checkpoints --out-dir llr_diagnostics
+Notes:
+  - This script does NO training.
+  - It assumes your shards exist (SHARDS_DIR/index.pt + shard_*.pt).
+  - It assumes checkpoints are saved as: <stem>_stepXXXXXXX<suffix>
+    (exactly as in your train.py _checkpoint_path_for_step()).
 """
 
 from __future__ import annotations
@@ -32,40 +37,34 @@ import csv
 import glob
 import os
 import re
-import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 import matplotlib
-matplotlib.use("Agg")  # safe for batch/cluster jobs
+matplotlib.use("Agg")  # headless-safe
 import matplotlib.pyplot as plt
 
 import MinkowskiEngine as ME
 
-# Robust imports whether run as script or module
+# Robust imports whether run as a script or as a module inside a package.
 try:
     from . import config as cfg  # type: ignore
-    from .dataset import BalancedBatchSampler, ShardDataset, collate_me_fusion  # type: ignore
+    from .dataset import ShardDataset, collate_me_fusion  # type: ignore
     from .fusion import MultiViewSetClassifier  # type: ignore
     from .model import make_backbone  # type: ignore
 except Exception:
     import config as cfg  # type: ignore
-    from dataset import BalancedBatchSampler, ShardDataset, collate_me_fusion  # type: ignore
+    from dataset import ShardDataset, collate_me_fusion  # type: ignore
     from fusion import MultiViewSetClassifier  # type: ignore
     from model import make_backbone  # type: ignore
 
 
 PLANES = ("u", "v", "w")
-
-
-def poly_lr(step: int, max_steps: int, lr0: float, power: float) -> float:
-    t = min(step / max_steps, 1.0)
-    return float(lr0) * (1.0 - t) ** float(power)
 
 
 def _load_meta(shards_dir: str) -> dict:
@@ -79,9 +78,9 @@ def _compute_splits_from_meta(
     val_fraction: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Match the split logic in your train.py:
+    Matches your train.py split logic:
       - optionally filter nnz>0 (if present in index.pt)
-      - RNG permute
+      - rng permute
       - take first VAL_FRACTION as val, rest train
     """
     n = int(meta["n_events"])
@@ -129,9 +128,20 @@ def _compute_splits_from_meta(
     return train_idx.astype(np.int64), val_idx.astype(np.int64)
 
 
+def _sort_event_indices_for_io(meta: dict, event_idx: np.ndarray) -> np.ndarray:
+    """
+    Sort by (shard_id, local_id) to reduce shard thrash during sequential inference.
+    """
+    shard_events = int(meta.get("shard_events", getattr(cfg, "SHARD_EVENTS", 2048)))
+    shard_id = (event_idx // shard_events).astype(np.int64, copy=False)
+    local_id = (event_idx - shard_id * shard_events).astype(np.int64, copy=False)
+    key = np.lexsort((local_id, shard_id))
+    return event_idx[key].astype(np.int64, copy=False)
+
+
 class ShardDatasetWithWeights(ShardDataset):
     """
-    Same as ShardDataset, but returns weight too.
+    Same as ShardDataset, but returns nominal weight too.
     """
 
     def __getitem__(self, i: int):
@@ -157,45 +167,6 @@ def _build_model_from_cfg(device: torch.device) -> nn.Module:
     return model
 
 
-def _make_loaders(
-    shards_dir: str,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    *,
-    num_workers: int,
-    batch_size: int,
-) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    ds_train = ShardDataset(shards_dir, train_idx, cache_size=2)
-    ds_val = ShardDatasetWithWeights(shards_dir, val_idx, cache_size=2)
-
-    batch_sampler = BalancedBatchSampler(
-        ds_train,
-        batch_size=int(batch_size),
-        seed=int(cfg.SEED),
-    )
-
-    dl_train = torch.utils.data.DataLoader(
-        ds_train,
-        batch_sampler=batch_sampler,
-        num_workers=int(num_workers),
-        collate_fn=collate_me_fusion,
-        pin_memory=True,
-        persistent_workers=(int(num_workers) > 0),
-    )
-
-    dl_val = torch.utils.data.DataLoader(
-        ds_val,
-        batch_size=int(batch_size),
-        shuffle=False,
-        num_workers=int(num_workers),
-        collate_fn=collate_me_fusion_with_weights,
-        pin_memory=True,
-        persistent_workers=(int(num_workers) > 0),
-    )
-
-    return dl_train, dl_val
-
-
 def _step_to_inputs(
     coords_by_plane: Dict[str, torch.Tensor],
     feats_by_plane: Dict[str, torch.Tensor],
@@ -213,316 +184,20 @@ def _step_to_inputs(
     return inputs
 
 
-def save_checkpoint(
-    path: Path,
-    *,
-    step: int,
-    model: nn.Module,
-    opt: Optional[torch.optim.Optimizer],
-    val_loss: Optional[float],
-) -> None:
-    payload = {
-        "step": int(step),
-        "time_unix": float(time.time()),
-        "model": model.state_dict(),
-        "opt": (opt.state_dict() if opt is not None else None),
-        "val_loss": (float(val_loss) if val_loss is not None else None),
-        "cfg": {
-            "BACKBONE": str(cfg.BACKBONE),
-            "EMBED_DIM": int(cfg.EMBED_DIM),
-            "H": int(cfg.H),
-            "W": int(cfg.W),
-            "THRESH": float(cfg.THRESH),
-            "BATCH_SIZE": int(cfg.BATCH_SIZE),
-            "SEED": int(cfg.SEED),
-        },
-    }
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    torch.save(payload, tmp)
-    tmp.replace(path)
-
-
-def _find_latest_checkpoint(ckpt_dir: Path) -> Optional[Path]:
-    ckpts = sorted(ckpt_dir.glob("ckpt_step*.pt"))
-    if not ckpts:
-        return None
-    # Sort by step parsed from filename
-    def step_of(p: Path) -> int:
-        m = re.search(r"ckpt_step(\d+)\.pt$", p.name)
-        return int(m.group(1)) if m else -1
-    ckpts = sorted(ckpts, key=step_of)
-    return ckpts[-1]
-
-
-def train_with_checkpoints(
-    *,
-    ckpt_dir: Path,
-    max_steps: int,
-    save_every: int,
-    resume: bool,
-) -> None:
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    torch.manual_seed(int(cfg.SEED))
-    np.random.seed(int(cfg.SEED))
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    meta = _load_meta(cfg.SHARDS_DIR)
-    train_idx, val_idx = _compute_splits_from_meta(meta, seed=cfg.SEED, val_fraction=cfg.VAL_FRACTION)
-
-    splits_path = ckpt_dir / "splits.npz"
-    if not splits_path.exists():
-        np.savez(splits_path, train_idx=train_idx, val_idx=val_idx)
-
-    dl_train, dl_val = _make_loaders(
-        cfg.SHARDS_DIR,
-        train_idx,
-        val_idx,
-        num_workers=cfg.NUM_WORKERS,
-        batch_size=cfg.BATCH_SIZE,
-    )
-
-    model = _build_model_from_cfg(device)
-    opt = torch.optim.SGD(
-        model.parameters(),
-        lr=float(cfg.LR0),
-        momentum=float(cfg.MOMENTUM),
-        weight_decay=float(cfg.WEIGHT_DECAY),
-    )
-    loss_fn = nn.BCEWithLogitsLoss()
-
-    start_step = 0
-    if resume:
-        last = _find_latest_checkpoint(ckpt_dir)
-        if last is not None:
-            ck = torch.load(last, map_location="cpu")
-            model.load_state_dict(ck["model"], strict=True)
-            if ck.get("opt") is not None:
-                opt.load_state_dict(ck["opt"])
-            start_step = int(ck.get("step", 0))
-            print(f"[resume] loaded {last} (step={start_step})")
-
-    # Save step-0 checkpoint if starting fresh
-    if start_step == 0:
-        save_checkpoint(ckpt_dir / f"ckpt_step{0:07d}.pt", step=0, model=model, opt=opt, val_loss=None)
-
-    it = iter(dl_train)
-
-    for step in range(start_step + 1, int(max_steps) + 1):
-        model.train()
-        coords_by_plane, feats_by_plane, y, available_mask = next(it)
-        y = y.to(device, non_blocking=True)
-
-        inputs = _step_to_inputs(coords_by_plane, feats_by_plane, device)
-        logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
-
-        if logits.shape != y.shape:
-            raise RuntimeError(
-                f"logits shape {tuple(logits.shape)} != y shape {tuple(y.shape)}; "
-                "this will broadcast in BCEWithLogitsLoss."
-            )
-
-        loss = loss_fn(logits, y)
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-        lr = poly_lr(step, int(max_steps), float(cfg.LR0), float(cfg.POLY_POWER))
-        for pg in opt.param_groups:
-            pg["lr"] = lr
-
-        if step % 200 == 0:
-            with torch.no_grad():
-                p = torch.sigmoid(logits)
-                acc = ((p > 0.5) == (y > 0.5)).float().mean().item()
-            print(f"step {step:7d}  loss {loss.item():.4f}  acc {acc:.3f}  lr {lr:.3e}")
-
-        val_loss: Optional[float] = None
-        if (step % int(save_every) == 0) or (step == int(max_steps)):
-            # quick-ish val loss estimate (same logic as train.py)
-            model.eval()
-            tot = 0.0
-            cnt = 0
-            with torch.no_grad():
-                for bi, (coords_by_plane, feats_by_plane, yv, wv, available_mask) in enumerate(dl_val):
-                    if bi >= int(cfg.VAL_BATCHES):
-                        break
-                    yv = yv.to(device, non_blocking=True)
-                    inputs = _step_to_inputs(coords_by_plane, feats_by_plane, device)
-                    lv = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
-                    if lv.shape != yv.shape:
-                        raise RuntimeError(
-                            f"[val] logits shape {tuple(lv.shape)} != y shape {tuple(yv.shape)}"
-                        )
-                    tot += loss_fn(lv, yv).item()
-                    cnt += 1
-            val_loss = float(tot / max(cnt, 1))
-            print(f"[val] step {step:7d}  loss {val_loss:.4f}")
-
-            save_checkpoint(
-                ckpt_dir / f"ckpt_step{step:07d}.pt",
-                step=step,
-                model=model,
-                opt=opt,
-                val_loss=val_loss,
-            )
-
-
-def _weighted_auc_pairwise(
-    z: np.ndarray,
-    y: np.ndarray,
-    w: np.ndarray,
-) -> float:
-    """
-    Weighted AUC with class-conditional sampling:
-      draw s ~ w within signal, b ~ w within bkg, compute P(z_s > z_b) + 0.5 P(equal).
-
-    This matches the "balanced priors" view and is consistent with the LLR story.
-    """
-    y = y.astype(np.uint8, copy=False)
-    w = np.clip(w.astype(np.float64, copy=False), 0.0, None)
-
-    z_s = z[y == 1]
-    z_b = z[y == 0]
-    w_s = w[y == 1]
-    w_b = w[y == 0]
-
-    if z_s.size == 0 or z_b.size == 0:
-        raise ValueError("need both classes for AUC")
-
-    sw = w_s.sum()
-    bw = w_b.sum()
-    if sw <= 0 or bw <= 0:
-        raise ValueError("weights must sum to >0 within each class for weighted AUC")
-
-    w_s = w_s / sw
-    order_b = np.argsort(z_b, kind="mergesort")
-    z_b = z_b[order_b]
-    w_b = (w_b[order_b] / bw)
-
-    cdf_b = np.cumsum(w_b)  # length n_b
-    cdf0 = np.concatenate([[0.0], cdf_b])  # length n_b+1; cdf0[k]=sum_{i<k} w_b[i]
-
-    idx_lt = np.searchsorted(z_b, z_s, side="left")
-    idx_le = np.searchsorted(z_b, z_s, side="right")
-
-    p_lt = cdf0[idx_lt]
-    p_le = cdf0[idx_le]
-    p_eq = p_le - p_lt
-
-    auc = float(np.sum(w_s * (p_lt + 0.5 * p_eq)))
-    return auc
-
-
-@dataclass
-class LLRConsistency:
-    step: int
-    n_val: int
-    auc_w: float
-    alpha: float
-    beta: float
-    mse: float
-    n_bins_used: int
-    z_lo: float
-    z_hi: float
-    val_loss: Optional[float]
-
-
-def _llr_consistency_from_scores(
-    z: np.ndarray,
-    y: np.ndarray,
-    w: np.ndarray,
-    *,
-    nbins: int,
-    q_lo: float,
-    q_hi: float,
-) -> Tuple[LLRConsistency, np.ndarray, np.ndarray]:
-    """
-    Returns:
-      - metrics (alpha,beta,mse,auc,...)
-      - x_centers_used
-      - r_used = log ps/pb in score space at those centers
-    """
-    z = z.astype(np.float64, copy=False)
-    y = y.astype(np.uint8, copy=False)
-    w = np.clip(w.astype(np.float64, copy=False), 0.0, None)
-
-    if z.size == 0:
-        raise ValueError("empty score array")
-
-    z_lo = float(np.quantile(z, float(q_lo)))
-    z_hi = float(np.quantile(z, float(q_hi)))
-    if not np.isfinite(z_lo) or not np.isfinite(z_hi) or z_hi <= z_lo:
-        # fallback: symmetric window around mean
-        m = float(np.mean(z))
-        s = float(np.std(z) + 1e-6)
-        z_lo, z_hi = m - 4.0 * s, m + 4.0 * s
-
-    edges = np.linspace(z_lo, z_hi, int(nbins) + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-
-    ys = (y == 1)
-    yb = (y == 0)
-
-    if ys.sum() == 0 or yb.sum() == 0:
-        raise ValueError("need both classes for LLR consistency histograms")
-
-    ws = w[ys]
-    wb = w[yb]
-    if ws.sum() <= 0 or wb.sum() <= 0:
-        raise ValueError("weights must sum to >0 within each class for histograms")
-
-    hs, _ = np.histogram(z[ys], bins=edges, weights=ws)
-    hb, _ = np.histogram(z[yb], bins=edges, weights=wb)
-
-    # class-conditional probabilities per bin (bin widths cancel in ratio since widths are equal)
-    ps = hs / max(hs.sum(), 1e-300)
-    pb = hb / max(hb.sum(), 1e-300)
-
-    mask = (ps > 0) & (pb > 0) & np.isfinite(ps) & np.isfinite(pb)
-    x = centers[mask]
-    r = (np.log(ps[mask]) - np.log(pb[mask]))
-
-    if x.size < 2:
-        # Not enough overlap in score space to fit.
-        alpha = float("nan")
-        beta = float("nan")
-        mse = float("nan")
-        n_used = int(x.size)
-    else:
-        # Linear fit r ≈ alpha*z + beta over overlap region
-        alpha, beta = np.polyfit(x, r, deg=1)
-        mse = float(np.mean((r - x) ** 2))
-        n_used = int(x.size)
-
-    auc_w = _weighted_auc_pairwise(z=z, y=y, w=w)
-
-    # step/val_loss are filled by caller (from checkpoint)
-    dummy = LLRConsistency(
-        step=-1,
-        n_val=int(z.size),
-        auc_w=float(auc_w),
-        alpha=float(alpha),
-        beta=float(beta),
-        mse=float(mse),
-        n_bins_used=int(n_used),
-        z_lo=float(z_lo),
-        z_hi=float(z_hi),
-        val_loss=None,
-    )
-    return dummy, x, r
-
-
 @torch.no_grad()
-def _infer_scores_on_val(
+def _infer_scores(
     model: nn.Module,
     dl_val: torch.utils.data.DataLoader,
     device: torch.device,
     *,
     max_batches: Optional[int],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns arrays (z, y, w):
+      z = logits (float64)
+      y = labels (uint8, 0/1)
+      w = nominal weights (float64, clipped to >=0 for consistency with training sampler)
+    """
     zs: List[np.ndarray] = []
     ys: List[np.ndarray] = []
     ws: List[np.ndarray] = []
@@ -532,6 +207,7 @@ def _infer_scores_on_val(
     for bi, (coords_by_plane, feats_by_plane, y, w, available_mask) in enumerate(dl_val):
         if max_batches is not None and bi >= int(max_batches):
             break
+
         y = y.to(device, non_blocking=True)
         w = w.to(device, non_blocking=True)
 
@@ -542,25 +218,125 @@ def _infer_scores_on_val(
             raise RuntimeError(f"[val] logits shape {tuple(logits.shape)} != y shape {tuple(y.shape)}")
 
         zs.append(logits.detach().cpu().numpy().astype(np.float64, copy=False))
-        ys.append(y.detach().cpu().numpy().astype(np.float32, copy=False))
+        ys.append(y.detach().cpu().numpy().astype(np.uint8, copy=False))
         ws.append(w.detach().cpu().numpy().astype(np.float64, copy=False))
 
     z = np.concatenate(zs, axis=0) if zs else np.zeros((0,), dtype=np.float64)
-    y = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.float32)
+    y = np.concatenate(ys, axis=0) if ys else np.zeros((0,), dtype=np.uint8)
     w = np.concatenate(ws, axis=0) if ws else np.zeros((0,), dtype=np.float64)
+    w = np.clip(w, 0.0, None)  # match training sampler behavior
     return z, y, w
 
 
-def _list_checkpoints(ckpt_dir: Path) -> List[Path]:
-    paths = [Path(p) for p in glob.glob(str(ckpt_dir / "ckpt_step*.pt"))]
+@dataclass
+class CurveMetrics:
+    step: int
+    n_val: int
+    nbins: int
+    q_lo: float
+    q_hi: float
+    z_lo: float
+    z_hi: float
+    n_bins_used: int
+    alpha: float
+    beta: float
+    mse_r_minus_z: float
+
+
+def _llr_curve_from_scores(
+    z: np.ndarray,
+    y: np.ndarray,
+    w: np.ndarray,
+    *,
+    step: int,
+    nbins: int,
+    q_lo: float,
+    q_hi: float,
+) -> Tuple[np.ndarray, np.ndarray, CurveMetrics]:
+    """
+    Build r(z)=log p_s(z)/p_b(z) using weighted histograms in score space.
+
+    Returns:
+      x: bin centers where both classes have support
+      r: log-ratio at those centers
+      metrics: slope/intercept fit and MSE of (r - x)
+    """
+    if z.size == 0:
+        raise ValueError("empty score array (no validation events processed?)")
+
+    z = z.astype(np.float64, copy=False)
+    y = y.astype(np.uint8, copy=False)
+    w = np.clip(w.astype(np.float64, copy=False), 0.0, None)
+
+    z_lo = float(np.quantile(z, float(q_lo)))
+    z_hi = float(np.quantile(z, float(q_hi)))
+    if not np.isfinite(z_lo) or not np.isfinite(z_hi) or z_hi <= z_lo:
+        m = float(np.mean(z))
+        s = float(np.std(z) + 1e-6)
+        z_lo, z_hi = m - 4.0 * s, m + 4.0 * s
+
+    edges = np.linspace(z_lo, z_hi, int(nbins) + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    ys = (y == 1)
+    yb = (y == 0)
+    if ys.sum() == 0 or yb.sum() == 0:
+        raise ValueError("need both signal and background in the evaluation sample")
+
+    ws = w[ys]
+    wb = w[yb]
+    if ws.sum() <= 0 or wb.sum() <= 0:
+        raise ValueError("weights must sum to >0 within each class (after clipping)")
+
+    hs, _ = np.histogram(z[ys], bins=edges, weights=ws)
+    hb, _ = np.histogram(z[yb], bins=edges, weights=wb)
+
+    ps = hs / max(hs.sum(), 1e-300)
+    pb = hb / max(hb.sum(), 1e-300)
+
+    mask = (ps > 0) & (pb > 0) & np.isfinite(ps) & np.isfinite(pb)
+    x = centers[mask]
+    r = (np.log(ps[mask]) - np.log(pb[mask]))
+
+    if x.size >= 2:
+        alpha, beta = np.polyfit(x, r, deg=1)
+        mse = float(np.mean((r - x) ** 2))
+    else:
+        alpha, beta, mse = float("nan"), float("nan"), float("nan")
+
+    metrics = CurveMetrics(
+        step=int(step),
+        n_val=int(z.size),
+        nbins=int(nbins),
+        q_lo=float(q_lo),
+        q_hi=float(q_hi),
+        z_lo=float(z_lo),
+        z_hi=float(z_hi),
+        n_bins_used=int(x.size),
+        alpha=float(alpha),
+        beta=float(beta),
+        mse_r_minus_z=float(mse),
+    )
+    return x, r, metrics
+
+
+def _checkpoint_glob_from_base(ckpt_base: Path) -> str:
+    # train.py creates: <stem>_stepXXXXXXX<suffix>
+    stem = ckpt_base.stem
+    suffix = ckpt_base.suffix
+    return str(ckpt_base.with_name(f"{stem}_step*{suffix}"))
+
+
+def _list_checkpoints(glob_pat: str) -> List[Path]:
+    paths = [Path(p) for p in glob.glob(glob_pat)]
     if not paths:
-        raise FileNotFoundError(f"no checkpoints found in {ckpt_dir} matching ckpt_step*.pt")
+        raise FileNotFoundError(f"no checkpoints matched glob: {glob_pat}")
 
     def step_of(p: Path) -> int:
-        m = re.search(r"ckpt_step(\d+)\.pt$", p.name)
+        # Prefer parsing from filename; fallback to reading file.
+        m = re.search(r"_step(\d+)\.", p.name)
         if m:
             return int(m.group(1))
-        # fallback: load and read step
         ck = torch.load(p, map_location="cpu")
         return int(ck.get("step", -1))
 
@@ -568,220 +344,222 @@ def _list_checkpoints(ckpt_dir: Path) -> List[Path]:
     return paths
 
 
-def analyze_checkpoints(
+def _select_checkpoints(
+    ckpts: List[Path],
     *,
-    ckpt_dir: Path,
-    out_dir: Path,
-    nbins: int,
-    q_lo: float,
-    q_hi: float,
-    max_val_batches: Optional[int],
     plot_count: int,
-) -> None:
+    steps: Optional[List[int]],
+) -> List[Path]:
+    if steps is not None and len(steps) > 0:
+        step_to_path: Dict[int, Path] = {}
+        for p in ckpts:
+            ck = torch.load(p, map_location="cpu")
+            step_to_path[int(ck.get("step", -1))] = p
+
+        out: List[Path] = []
+        missing: List[int] = []
+        for s in steps:
+            if int(s) in step_to_path:
+                out.append(step_to_path[int(s)])
+            else:
+                missing.append(int(s))
+        if missing:
+            avail = sorted(step_to_path.keys())
+            raise FileNotFoundError(
+                f"requested steps not found: {missing}. available steps (first 30): {avail[:30]} ..."
+            )
+        return out
+
+    # Evenly spaced selection across the list.
+    if plot_count <= 0 or len(ckpts) == 0:
+        return []
+    if len(ckpts) <= plot_count:
+        return ckpts
+    idxs = np.linspace(0, len(ckpts) - 1, plot_count, dtype=int)
+    return [ckpts[int(i)] for i in idxs]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument(
+        "--ckpt-base",
+        type=str,
+        default=getattr(cfg, "CHECKPOINT_PATH", None),
+        help="Same path you used for cfg.CHECKPOINT_PATH in training (e.g. checkpoints/ckpt.pt). "
+             "This script will glob <stem>_step*<suffix> next to it.",
+    )
+    ap.add_argument(
+        "--ckpt-glob",
+        type=str,
+        default=None,
+        help='Explicit glob for checkpoints, e.g. "checkpoints/ckpt_step*.pt". '
+             "Overrides --ckpt-base if set.",
+    )
+    ap.add_argument("--out-dir", type=str, default="llr_diag")
+    ap.add_argument("--plot-name", type=str, default="llr_consistency.png")
+
+    ap.add_argument("--nbins", type=int, default=60)
+    ap.add_argument("--q-lo", type=float, default=0.005)
+    ap.add_argument("--q-hi", type=float, default=0.995)
+
+    ap.add_argument(
+        "--plot-count",
+        type=int,
+        default=6,
+        help="How many checkpoints to overlay (evenly spaced). Ignored if --steps is set.",
+    )
+    ap.add_argument(
+        "--steps",
+        type=str,
+        default=None,
+        help="Comma-separated list of checkpoint steps to plot (exact match), e.g. '0,2000,4000'.",
+    )
+    ap.add_argument(
+        "--max-val-batches",
+        type=int,
+        default=None,
+        help="If set, cap how many validation batches to use per checkpoint (for speed).",
+    )
+    ap.add_argument(
+        "--val-size",
+        type=int,
+        default=None,
+        help="If set, use only the first N events of the (deterministic) val split (then IO-sorted).",
+    )
+    ap.add_argument("--batch-size", type=int, default=int(cfg.BATCH_SIZE))
+    ap.add_argument("--num-workers", type=int, default=int(cfg.NUM_WORKERS))
+
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.ckpt_glob is not None:
+        glob_pat = args.ckpt_glob
+    else:
+        if args.ckpt_base is None:
+            raise ValueError("Need --ckpt-glob or --ckpt-base (and cfg.CHECKPOINT_PATH was not set).")
+        glob_pat = _checkpoint_glob_from_base(Path(args.ckpt_base))
+
+    ckpts = _list_checkpoints(glob_pat)
+
+    steps_list: Optional[List[int]] = None
+    if args.steps is not None:
+        steps_list = [int(s.strip()) for s in args.steps.split(",") if s.strip()]
+
+    selected = _select_checkpoints(ckpts, plot_count=int(args.plot_count), steps=steps_list)
+    if not selected:
+        raise RuntimeError("No checkpoints selected for plotting.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     meta = _load_meta(cfg.SHARDS_DIR)
+    _, val_idx = _compute_splits_from_meta(meta, seed=int(cfg.SEED), val_fraction=float(cfg.VAL_FRACTION))
 
-    # Prefer saved splits if present to guarantee you analyze the same held-out set you trained with.
-    splits_path = ckpt_dir / "splits.npz"
-    if splits_path.exists():
-        sp = np.load(splits_path)
-        train_idx = sp["train_idx"].astype(np.int64, copy=False)
-        val_idx = sp["val_idx"].astype(np.int64, copy=False)
-    else:
-        train_idx, val_idx = _compute_splits_from_meta(meta, seed=cfg.SEED, val_fraction=cfg.VAL_FRACTION)
+    if args.val_size is not None:
+        n = int(args.val_size)
+        if n <= 0:
+            raise ValueError("--val-size must be > 0")
+        val_idx = val_idx[: min(n, val_idx.size)]
 
-    _, dl_val = _make_loaders(
-        cfg.SHARDS_DIR,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        num_workers=cfg.NUM_WORKERS,
-        batch_size=cfg.BATCH_SIZE,
+    val_idx = _sort_event_indices_for_io(meta, val_idx)
+
+    ds_val = ShardDatasetWithWeights(cfg.SHARDS_DIR, val_idx, cache_size=2)
+    dl_val = torch.utils.data.DataLoader(
+        ds_val,
+        batch_size=int(args.batch_size),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        collate_fn=collate_me_fusion_with_weights,
+        pin_memory=True,
+        persistent_workers=(int(args.num_workers) > 0),
     )
 
-    ckpts = _list_checkpoints(ckpt_dir)
-
-    # Select a small subset of checkpoints for the r(z) plot (avoid unreadable spaghetti).
-    if plot_count <= 0:
-        plot_steps: set[int] = set()
-    else:
-        if len(ckpts) <= plot_count:
-            plot_steps = set(range(len(ckpts)))
-        else:
-            idxs = np.linspace(0, len(ckpts) - 1, plot_count, dtype=int)
-            plot_steps = set(int(i) for i in idxs)
-
-    # Build model once, then just load weights each time (assumes consistent architecture).
     model = _build_model_from_cfg(device)
 
-    metrics: List[LLRConsistency] = []
-    curves: List[Tuple[int, np.ndarray, np.ndarray]] = []  # (step, x, r)
+    curves: List[Tuple[int, np.ndarray, np.ndarray]] = []
+    metrics_all: List[CurveMetrics] = []
 
-    for i, p in enumerate(ckpts):
+    for p in selected:
         ck = torch.load(p, map_location="cpu")
         step = int(ck.get("step", -1))
-        model.load_state_dict(ck["model"], strict=True)
+        state = ck.get("model", None)
+        if state is None:
+            raise KeyError(f"checkpoint {p} does not contain key 'model'")
 
-        z, y, w = _infer_scores_on_val(model, dl_val, device, max_batches=max_val_batches)
+        model.load_state_dict(state, strict=True)
 
-        base, x, r = _llr_consistency_from_scores(
-            z=z, y=y, w=w, nbins=int(nbins), q_lo=float(q_lo), q_hi=float(q_hi)
+        z, y, w = _infer_scores(model, dl_val, device, max_batches=args.max_val_batches)
+        x, r, m = _llr_curve_from_scores(
+            z=z,
+            y=y,
+            w=w,
+            step=step,
+            nbins=int(args.nbins),
+            q_lo=float(args.q_lo),
+            q_hi=float(args.q_hi),
         )
-        base.step = int(step)
-        base.val_loss = (float(ck["val_loss"]) if ck.get("val_loss", None) is not None else None)
-        metrics.append(base)
 
-        if i in plot_steps:
-            curves.append((int(step), x, r))
+        curves.append((step, x, r))
+        metrics_all.append(m)
 
         print(
-            f"[analyze] step={step:7d}  n_val={base.n_val:6d}  "
-            f"auc_w={base.auc_w:.4f}  alpha={base.alpha:.3f}  beta={base.beta:.3f}  mse={base.mse:.3f}  "
-            f"bins_used={base.n_bins_used:3d}  z_range=[{base.z_lo:.2f},{base.z_hi:.2f}]"
+            f"[plot] step={step:7d}  n_val={m.n_val:6d}  "
+            f"bins_used={m.n_bins_used:3d}  z_range=[{m.z_lo:.2f},{m.z_hi:.2f}]  "
+            f"alpha={m.alpha:.3f} beta={m.beta:.3f} mse={m.mse_r_minus_z:.3f}"
         )
 
     # Write metrics.csv
-    csv_path = out_dir / "metrics.csv"
-    with open(csv_path, "w", newline="") as f:
+    metrics_path = out_dir / "metrics.csv"
+    with metrics_path.open("w", newline="") as f:
         wcsv = csv.DictWriter(
             f,
             fieldnames=[
                 "step",
                 "n_val",
-                "auc_w",
-                "alpha",
-                "beta",
-                "mse",
-                "n_bins_used",
+                "nbins",
+                "q_lo",
+                "q_hi",
                 "z_lo",
                 "z_hi",
-                "val_loss",
+                "n_bins_used",
+                "alpha",
+                "beta",
+                "mse_r_minus_z",
             ],
         )
         wcsv.writeheader()
-        for m in metrics:
-            wcsv.writerow(asdict(m))
+        for m in sorted(metrics_all, key=lambda t: t.step):
+            wcsv.writerow(vars(m))
 
-    # Plot: AUC vs step
-    steps = np.array([m.step for m in metrics], dtype=np.int64)
-    aucs = np.array([m.auc_w for m in metrics], dtype=np.float64)
-    plt.figure()
-    plt.plot(steps, aucs, marker="o")
-    plt.xlabel("training step")
-    plt.ylabel("weighted AUC (class-conditional)")
-    plt.title("AUC vs step")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / "auc_vs_step.png", dpi=160)
-    plt.close()
-
-    # Plot: alpha, beta, mse vs step
-    alphas = np.array([m.alpha for m in metrics], dtype=np.float64)
-    betas = np.array([m.beta for m in metrics], dtype=np.float64)
-    mses = np.array([m.mse for m in metrics], dtype=np.float64)
-
-    plt.figure()
-    plt.plot(steps, alphas, marker="o", label="alpha (slope)")
-    plt.plot(steps, betas, marker="o", label="beta (intercept)")
-    plt.xlabel("training step")
-    plt.ylabel("fit params")
-    plt.title("r(z) ≈ alpha*z + beta")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "alpha_beta_vs_step.png", dpi=160)
-    plt.close()
-
-    plt.figure()
-    plt.plot(steps, mses, marker="o")
-    plt.xlabel("training step")
-    plt.ylabel("MSE of (r(z)-z) over overlap bins")
-    plt.title("LLR consistency error vs step")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_dir / "mse_vs_step.png", dpi=160)
-    plt.close()
-
-    # Plot: LLR consistency curves r(z) vs z (selected checkpoints)
-    plt.figure()
-    # Reference line y=x (on union range of plotted curves)
-    if curves:
-        allx = np.concatenate([c[1] for c in curves if c[1].size > 0], axis=0)
-        if allx.size > 0:
-            xmin = float(np.min(allx))
-            xmax = float(np.max(allx))
-            refx = np.linspace(xmin, xmax, 200)
-            plt.plot(refx, refx, linestyle="--", label="y=x")
-
+    # Plot
     curves.sort(key=lambda t: t[0])
+    plt.figure()
+
+    allx = np.concatenate([x for (_, x, _) in curves if x.size > 0], axis=0) if curves else np.array([])
+    if allx.size > 0:
+        xmin = float(np.min(allx))
+        xmax = float(np.max(allx))
+        refx = np.linspace(xmin, xmax, 200)
+        plt.plot(refx, refx, linestyle="--", label="y=x")
+
     for step, x, r in curves:
         if x.size >= 2:
             plt.plot(x, r, marker=".", linewidth=1.0, label=f"step {step}")
 
     plt.xlabel("z (model logit)")
-    plt.ylabel("r(z) = log p_s(z)/p_b(z) (weighted hist)")
+    plt.ylabel("r(z) = log p_s(z) - log p_b(z)  (weighted hist in score space)")
     plt.title("LLR self-consistency in score space")
     plt.grid(True, alpha=0.3)
     plt.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(out_dir / "llr_consistency.png", dpi=160)
+
+    plot_path = out_dir / str(args.plot_name)
+    plt.savefig(plot_path, dpi=180)
     plt.close()
 
-    print(f"[done] wrote {csv_path} and plots to {out_dir}/")
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    ap_train = sub.add_parser("train")
-    ap_train.add_argument("--ckpt-dir", type=str, default="checkpoints")
-    ap_train.add_argument("--max-steps", type=int, default=int(cfg.MAX_STEPS))
-    ap_train.add_argument("--save-every", type=int, default=int(cfg.VAL_EVERY))
-    ap_train.add_argument("--resume", action="store_true")
-
-    ap_an = sub.add_parser("analyze")
-    ap_an.add_argument("--ckpt-dir", type=str, default="checkpoints")
-    ap_an.add_argument("--out-dir", type=str, default="llr_diagnostics")
-    ap_an.add_argument("--nbins", type=int, default=60)
-    ap_an.add_argument("--q-lo", type=float, default=0.005)
-    ap_an.add_argument("--q-hi", type=float, default=0.995)
-    ap_an.add_argument(
-        "--max-val-batches",
-        type=int,
-        default=None,
-        help="If set, cap how many val batches are used per checkpoint (for speed).",
-    )
-    ap_an.add_argument(
-        "--plot-count",
-        type=int,
-        default=6,
-        help="How many checkpoints to overlay in llr_consistency.png (evenly spaced).",
-    )
-
-    args = ap.parse_args()
-
-    if args.cmd == "train":
-        train_with_checkpoints(
-            ckpt_dir=Path(args.ckpt_dir),
-            max_steps=int(args.max_steps),
-            save_every=int(args.save_every),
-            resume=bool(args.resume),
-        )
-    elif args.cmd == "analyze":
-        analyze_checkpoints(
-            ckpt_dir=Path(args.ckpt_dir),
-            out_dir=Path(args.out_dir),
-            nbins=int(args.nbins),
-            q_lo=float(args.q_lo),
-            q_hi=float(args.q_hi),
-            max_val_batches=(int(args.max_val_batches) if args.max_val_batches is not None else None),
-            plot_count=int(args.plot_count),
-        )
-    else:
-        raise RuntimeError(f"unknown cmd {args.cmd!r}")
+    print(f"[done] wrote {plot_path} and {metrics_path}")
 
 
 if __name__ == "__main__":
