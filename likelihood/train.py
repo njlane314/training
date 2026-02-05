@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import math
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -116,6 +117,37 @@ def train_llr():
         persistent_workers=(cfg.NUM_WORKERS > 0),
     )
 
+    # Validation can dominate wall time (extra forward pass + shard I/O) if run every step.
+    # Run it periodically instead, and optionally cache a few fixed val batches in RAM.
+    #
+    # Knobs (all optional; read via getattr so config.py doesn't have to define them):
+    #   VAL_EVERY         : validate every N steps (0 disables validation). Default: 200
+    #   VAL_NUM_BATCHES   : average validation loss over N batches. Default: 1
+    #   VAL_CACHE_BATCHES : prefetch N validation batches at startup (RAM) to avoid shard I/O later. Default: 0
+    val_every = int(getattr(cfg, "VAL_EVERY", 200))
+    val_num_batches = int(getattr(cfg, "VAL_NUM_BATCHES", 1))
+    val_cache_batches = int(getattr(cfg, "VAL_CACHE_BATCHES", 0))
+    if val_every < 0:
+        raise ValueError("VAL_EVERY must be >= 0")
+    if val_num_batches <= 0:
+        raise ValueError("VAL_NUM_BATCHES must be >= 1")
+    if val_cache_batches < 0:
+        raise ValueError("VAL_CACHE_BATCHES must be >= 0")
+
+    cached_val_batches = []
+    val_it = iter(dl_val)
+    if val_every > 0 and val_cache_batches > 0:
+        for _ in range(val_cache_batches):
+            try:
+                cached_val_batches.append(next(val_it))
+            except StopIteration:
+                val_it = iter(dl_val)
+                cached_val_batches.append(next(val_it))
+        print(
+            f"[val] cached {len(cached_val_batches)} val batches in RAM "
+            f"(VAL_CACHE_BATCHES={val_cache_batches})"
+        )
+
     planes = ("u", "v", "w")
     backbone = make_backbone(cfg.BACKBONE, in_ch=2, embed_dim=cfg.EMBED_DIM).to(device)
     model = MultiViewSetClassifier(backbone=backbone, embed_dim=cfg.EMBED_DIM, plane_names=planes).to(device)
@@ -128,10 +160,11 @@ def train_llr():
     loss_fn = nn.BCEWithLogitsLoss()  # unweighted
 
     it = iter(dl_train)
-    val_it = iter(dl_val)
     log_path = Path(getattr(cfg, "LOSS_LOG_PATH", "loss.tsv"))
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_f = log_path.open("w", buffering=1)
+    # Line-buffered logging can be slow on network filesystems. Use a larger buffer and flush occasionally.
+    log_flush_every = int(getattr(cfg, "LOG_FLUSH_EVERY", 50))
+    log_f = log_path.open("w", buffering=64 * 1024)
     log_f.write("#step\tis_val\tloss\n")
 
     ckpt_base_path = Path(cfg.CHECKPOINT_PATH)
@@ -207,34 +240,52 @@ def train_llr():
                 acc = ((p > 0.5) == (y > 0.5)).float().mean().item()
             print(f"step {step:7d}  loss {loss.item():.4f}  acc {acc:.3f}  lr {lr:.3e}")
 
-        model.eval()
-        with torch.no_grad():
-            try:
-                coords_by_plane, feats_by_plane, y, available_mask = next(val_it)
-            except StopIteration:
-                val_it = iter(dl_val)
-                coords_by_plane, feats_by_plane, y, available_mask = next(val_it)
+        do_val = (val_every > 0) and (step % val_every == 0 or step == cfg.MAX_STEPS)
+        if do_val:
+            model.eval()
+            with torch.no_grad():
+                # If we cached batches, use them (fixed probe set, no shard I/O).
+                # Otherwise, draw val_num_batches fresh batches and average.
+                if cached_val_batches:
+                    batches = cached_val_batches
+                else:
+                    batches = []
+                    for _ in range(val_num_batches):
+                        try:
+                            batches.append(next(val_it))
+                        except StopIteration:
+                            val_it = iter(dl_val)
+                            batches.append(next(val_it))
 
-            y = y.to(device, non_blocking=True)
-            inputs: Dict[str, ME.SparseTensor] = {}
-            for name in planes:
-                feats = feats_by_plane[name].to(device, non_blocking=True)
-                coords = coords_by_plane[name]  # CPU int32
-                inputs[name] = ME.SparseTensor(
-                    features=feats,
-                    coordinates=coords,
-                    device=device,
-                )
-            logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
-            if logits.shape != y.shape:
-                raise RuntimeError(
-                    f"[val] logits shape {tuple(logits.shape)} != y shape {tuple(y.shape)}; "
-                    "check ME batching / coordinates."
-                )
-            val_loss = loss_fn(logits, y).item()
-        if step % 200 == 0:
-            print(f"[val] step {step:7d}  loss {val_loss:.4f}")
-        log_f.write(f"{step}\t1\t{val_loss:.8g}\n")
+                vloss = 0.0
+                for coords_by_plane, feats_by_plane, yv, available_mask in batches:
+                    yv = yv.to(device, non_blocking=True)
+                    inputs: Dict[str, ME.SparseTensor] = {}
+                    for name in planes:
+                        feats = feats_by_plane[name].to(device, non_blocking=True)
+                        coords = coords_by_plane[name]  # CPU int32
+                        inputs[name] = ME.SparseTensor(
+                            features=feats,
+                            coordinates=coords,
+                            device=device,
+                        )
+                    vlogits = model(
+                        inputs, available_mask=available_mask.to(device, non_blocking=True)
+                    ).squeeze(1)
+                    if vlogits.shape != yv.shape:
+                        raise RuntimeError(
+                            f"[val] logits shape {tuple(vlogits.shape)} != y shape {tuple(yv.shape)}; "
+                            "check ME batching / coordinates."
+                        )
+                    vloss += loss_fn(vlogits, yv).item()
+                val_loss = vloss / float(len(batches))
+
+            if step % 200 == 0:
+                print(f"[val] step {step:7d}  loss {val_loss:.4f}")
+            log_f.write(f"{step}\t1\t{val_loss:.8g}\n")
+
+        if log_flush_every > 0 and step % log_flush_every == 0:
+            log_f.flush()
 
         if cfg.CHECKPOINT_EVERY > 0 and step % cfg.CHECKPOINT_EVERY == 0:
             ckpt_path = _checkpoint_path_for_step(ckpt_base_path, step=step)
