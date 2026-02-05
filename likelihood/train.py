@@ -25,6 +25,13 @@ def _capture_random_state():
         state["torch_cuda"] = torch.cuda.get_rng_state_all()
     return state
 
+
+def _checkpoint_path_for_step(base_path: Path, step: int) -> Path:
+    stem = base_path.stem
+    suffix = base_path.suffix
+    return base_path.with_name(f"{stem}_step{step:07d}{suffix}")
+
+
 def train_llr():
     torch.manual_seed(cfg.SEED)
     np.random.seed(cfg.SEED)
@@ -126,11 +133,12 @@ def train_llr():
     log_f = log_path.open("w", buffering=1)
     log_f.write("#step\tis_val\tloss\n")
 
-    ckpt_path = Path(cfg.CHECKPOINT_PATH)
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_base_path = Path(cfg.CHECKPOINT_PATH)
+    ckpt_base_path.parent.mkdir(parents=True, exist_ok=True)
 
     initial_random_state = _capture_random_state()
     if cfg.CHECKPOINT_EVERY > 0:
+        ckpt_path = _checkpoint_path_for_step(ckpt_base_path, step=0)
         torch.save(
             {
                 "step": 0,
@@ -229,6 +237,7 @@ def train_llr():
             log_f.write(f"{step}\t1\t{val_loss:.8g}\n")
 
         if cfg.CHECKPOINT_EVERY > 0 and step % cfg.CHECKPOINT_EVERY == 0:
+            ckpt_path = _checkpoint_path_for_step(ckpt_base_path, step=step)
             torch.save(
                 {
                     "step": step,

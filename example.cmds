@@ -38,7 +38,7 @@ export WEIGHT_DECAY=1e-4
 export NUM_WORKERS=8
 export SEED=12345
 export VAL_FRAC=0.1
-export OUT="checkpoint.pt"
+export OUT="checkpoints/checkpoint.pt"
 
 export BASE_FILTERS=32
 export NUM_STRIDES=4
