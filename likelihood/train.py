@@ -128,6 +128,7 @@ def train_llr():
     loss_fn = nn.BCEWithLogitsLoss()  # unweighted
 
     it = iter(dl_train)
+    val_it = iter(dl_val)
     log_path = Path(getattr(cfg, "LOSS_LOG_PATH", "loss.tsv"))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_f = log_path.open("w", buffering=1)
@@ -206,35 +207,34 @@ def train_llr():
                 acc = ((p > 0.5) == (y > 0.5)).float().mean().item()
             print(f"step {step:7d}  loss {loss.item():.4f}  acc {acc:.3f}  lr {lr:.3e}")
 
-        if step % cfg.VAL_EVERY == 0:
-            model.eval()
-            tot = 0.0
-            cnt = 0
-            with torch.no_grad():
-                for bi, (coords_by_plane, feats_by_plane, y, available_mask) in enumerate(dl_val):
-                    if bi >= cfg.VAL_BATCHES:
-                        break
-                    y = y.to(device, non_blocking=True)
-                    inputs: Dict[str, ME.SparseTensor] = {}
-                    for name in planes:
-                        feats = feats_by_plane[name].to(device, non_blocking=True)
-                        coords = coords_by_plane[name]  # CPU int32
-                        inputs[name] = ME.SparseTensor(
-                            features=feats,
-                            coordinates=coords,
-                            device=device,
-                        )
-                    logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
-                    if logits.shape != y.shape:
-                        raise RuntimeError(
-                            f"[val] logits shape {tuple(logits.shape)} != y shape {tuple(y.shape)}; "
-                            "check ME batching / coordinates."
-                        )
-                    tot += loss_fn(logits, y).item()
-                    cnt += 1
-            val_loss = tot / max(cnt, 1)
+        model.eval()
+        with torch.no_grad():
+            try:
+                coords_by_plane, feats_by_plane, y, available_mask = next(val_it)
+            except StopIteration:
+                val_it = iter(dl_val)
+                coords_by_plane, feats_by_plane, y, available_mask = next(val_it)
+
+            y = y.to(device, non_blocking=True)
+            inputs: Dict[str, ME.SparseTensor] = {}
+            for name in planes:
+                feats = feats_by_plane[name].to(device, non_blocking=True)
+                coords = coords_by_plane[name]  # CPU int32
+                inputs[name] = ME.SparseTensor(
+                    features=feats,
+                    coordinates=coords,
+                    device=device,
+                )
+            logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
+            if logits.shape != y.shape:
+                raise RuntimeError(
+                    f"[val] logits shape {tuple(logits.shape)} != y shape {tuple(y.shape)}; "
+                    "check ME batching / coordinates."
+                )
+            val_loss = loss_fn(logits, y).item()
+        if step % 200 == 0:
             print(f"[val] step {step:7d}  loss {val_loss:.4f}")
-            log_f.write(f"{step}\t1\t{val_loss:.8g}\n")
+        log_f.write(f"{step}\t1\t{val_loss:.8g}\n")
 
         if cfg.CHECKPOINT_EVERY > 0 and step % cfg.CHECKPOINT_EVERY == 0:
             ckpt_path = _checkpoint_path_for_step(ckpt_base_path, step=step)
