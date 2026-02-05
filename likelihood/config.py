@@ -48,4 +48,5 @@ VAL_FRACTION = _env("VAL_FRACTION", 0.1, float)
 VAL_EVERY = _env("VAL_EVERY", 2000, int)
 VAL_BATCHES = _env("VAL_BATCHES", 50, int)
 CHECKPOINT_EVERY = _env("CHECKPOINT_EVERY", 1000, int)
+
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "checkpoints/checkpoint.pt")
