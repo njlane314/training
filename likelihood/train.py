@@ -138,6 +138,20 @@ def train_llr():
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
+
+        if step % 200 == 0:
+            with torch.no_grad():
+                print("logits mean/std:", logits.mean().item(), logits.std().item())
+
+            gn = 0.0
+            nz = 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    gn += g.norm().item() ** 2
+                    nz += int(g.abs().sum().item() > 0)
+            print("grad L2:", (gn ** 0.5), "nonzero_grad_params:", nz)
+
         opt.step()
 
         # Poly LR schedule
