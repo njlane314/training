@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Dict, Optional
 
 import MinkowskiEngine as ME
 
@@ -116,15 +116,24 @@ def train_llr():
         coords_by_plane, feats_by_plane, y, available_mask = next(it)
         y = y.to(device, non_blocking=True)
 
-        inputs = {
-            name: ME.SparseTensor(
-                features=feats_by_plane[name].to(device, non_blocking=True),
-                coordinates=coords_by_plane[name].to(device, non_blocking=True),
+        # IMPORTANT: keep ME coordinates on CPU; move only features to GPU.
+        inputs: Dict[str, ME.SparseTensor] = {}
+        for name in planes:
+            feats = feats_by_plane[name].to(device, non_blocking=True)
+            coords = coords_by_plane[name]  # CPU int32
+            inputs[name] = ME.SparseTensor(
+                features=feats,
+                coordinates=coords,
                 device=device,
             )
-            for name in planes
-        }
         logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
+        # Guard against silent broadcasting (a common cause of "stuck at 0.6931/0.5")
+        if logits.shape != y.shape:
+            raise RuntimeError(
+                f"logits shape {tuple(logits.shape)} != y shape {tuple(y.shape)}; "
+                "this will broadcast in BCEWithLogitsLoss and can produce zero gradients with balanced batches. "
+                "Check ME batching / coordinates batch index."
+            )
         loss = loss_fn(logits, y)
 
         opt.zero_grad(set_to_none=True)
@@ -151,15 +160,21 @@ def train_llr():
                     if bi >= cfg.VAL_BATCHES:
                         break
                     y = y.to(device, non_blocking=True)
-                    inputs = {
-                        name: ME.SparseTensor(
-                            features=feats_by_plane[name].to(device, non_blocking=True),
-                            coordinates=coords_by_plane[name].to(device, non_blocking=True),
+                    inputs: Dict[str, ME.SparseTensor] = {}
+                    for name in planes:
+                        feats = feats_by_plane[name].to(device, non_blocking=True)
+                        coords = coords_by_plane[name]  # CPU int32
+                        inputs[name] = ME.SparseTensor(
+                            features=feats,
+                            coordinates=coords,
                             device=device,
                         )
-                        for name in planes
-                    }
                     logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
+                    if logits.shape != y.shape:
+                        raise RuntimeError(
+                            f"[val] logits shape {tuple(logits.shape)} != y shape {tuple(y.shape)}; "
+                            "check ME batching / coordinates."
+                        )
                     tot += loss_fn(logits, y).item()
                     cnt += 1
             print(f"[val] step {step:7d}  loss {tot/max(cnt,1):.4f}")
