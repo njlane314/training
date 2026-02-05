@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from pathlib import Path
 from typing import Dict, Optional
 
 import MinkowskiEngine as ME
@@ -110,6 +111,10 @@ def train_llr():
     loss_fn = nn.BCEWithLogitsLoss()  # unweighted
 
     it = iter(dl_train)
+    log_path = Path(getattr(cfg, "LOSS_LOG_PATH", "loss.tsv"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_f = log_path.open("w", buffering=1)
+    log_f.write("#step\tis_val\tloss\n")
 
     for step in range(1, cfg.MAX_STEPS + 1):
         model.train()
@@ -135,6 +140,7 @@ def train_llr():
                 "Check ME batching / coordinates batch index."
             )
         loss = loss_fn(logits, y)
+        log_f.write(f"{step}\t0\t{loss.item():.8g}\n")
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -191,4 +197,8 @@ def train_llr():
                         )
                     tot += loss_fn(logits, y).item()
                     cnt += 1
-            print(f"[val] step {step:7d}  loss {tot/max(cnt,1):.4f}")
+            val_loss = tot / max(cnt, 1)
+            print(f"[val] step {step:7d}  loss {val_loss:.4f}")
+            log_f.write(f"{step}\t1\t{val_loss:.8g}\n")
+
+    log_f.close()

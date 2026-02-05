@@ -37,10 +37,10 @@ SHARDS_DIR = os.environ.get("SHARDS_DIR", os.environ.get("PROCESS_OUT_DIR", "sha
 # Backward-compatible alias
 PROCESS_OUT_DIR = SHARDS_DIR
 SEED = _env("SEED", 123, int)
-BATCH_SIZE = _env("BATCH_SIZE", 16, int)
+BATCH_SIZE = _env("BATCH_SIZE", 32, int)
 NUM_WORKERS = _env("NUM_WORKERS", 4, int)
 MAX_STEPS = _env("MAX_STEPS", 200_000, int)
-LR0 = _env("LR0", 1e-1, float)
+LR0 = _env("LR0", 0.01, float)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 1e-4, float)
 MOMENTUM = _env("MOMENTUM", 0.9, float)
 POLY_POWER = _env("POLY_POWER", 0.9, float)
