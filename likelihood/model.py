@@ -8,6 +8,59 @@ import torch.nn as nn
 import MinkowskiEngine as ME
 
 
+def _replace_feature(x: ME.SparseTensor, new_F: torch.Tensor) -> ME.SparseTensor:
+    """
+    Compatibility wrapper for SparseTensor feature replacement.
+
+    Newer MinkowskiEngine versions provide `SparseTensor.replace_feature`.
+    Older versions require re-instantiating a SparseTensor while *sharing*
+    the same coordinate map + manager (coords_key/coords_man or
+    coordinate_map_key/coordinate_manager).
+    """
+    if hasattr(x, "replace_feature"):
+        return x.replace_feature(new_F)
+
+    # Collect whatever this ME build exposes on the tensor.
+    cmk = getattr(x, "coordinate_map_key", None)
+    cm = getattr(x, "coordinate_manager", None)
+    ck = getattr(x, "coords_key", None)
+    # Older builds commonly use `coords_man`; some use `coords_manager`.
+    cman = getattr(x, "coords_man", None)
+    if cman is None:
+        cman = getattr(x, "coords_manager", None)
+
+    # Try "new" ctor keywords first, then legacy ones.
+    if cmk is not None and cm is not None:
+        try:
+            return ME.SparseTensor(
+                features=new_F,
+                coordinate_map_key=cmk,
+                coordinate_manager=cm,
+                device=new_F.device,
+            )
+        except TypeError:
+            pass
+
+    if ck is not None and cman is not None:
+        try:
+            return ME.SparseTensor(
+                features=new_F,
+                coords_key=ck,
+                coords_manager=cman,
+                device=new_F.device,
+            )
+        except TypeError:
+            pass
+
+    # As a last resort, rebuild from explicit coordinates (may create a new
+    # coordinate manager; this is less ideal but avoids hard failure).
+    return ME.SparseTensor(
+        features=new_F,
+        coordinates=x.C,
+        device=new_F.device,
+    )
+
+
 def _subm_conv(
     in_ch: int,
     out_ch: int,
@@ -55,7 +108,7 @@ class SparseLayerNorm(nn.Module):
         self.ln = nn.LayerNorm(int(c), eps=eps)
 
     def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
-        return x.replace_feature(self.ln(x.F))
+        return _replace_feature(x, self.ln(x.F))
 
 
 class ResBlock(nn.Module):
