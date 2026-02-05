@@ -89,6 +89,8 @@ def train_llr():
         seed=cfg.SEED,
     )
 
+    val_batch_sampler = BalancedBatchSampler(ds_val, batch_size=cfg.BATCH_SIZE, seed=cfg.SEED + 999)
+
     dl_train = torch.utils.data.DataLoader(
         ds_train,
         batch_sampler=batch_sampler,
@@ -100,8 +102,7 @@ def train_llr():
 
     dl_val = torch.utils.data.DataLoader(
         ds_val,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=False,
+        batch_sampler=val_batch_sampler,
         num_workers=cfg.NUM_WORKERS,
         collate_fn=collate_me_fusion,
         pin_memory=True,
