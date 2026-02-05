@@ -29,6 +29,9 @@ SHARD_EVENTS = _env("SHARD_EVENTS", 2048, int)
 CHUNK_EVENTS = _env("CHUNK_EVENTS", 256, int)
 MAX_BAD_EVENT_LOG = _env("MAX_BAD_EVENT_LOG", 25, int)
 
+UPROOT_DECOMP_WORKERS = _env("UPROOT_DECOMP_WORKERS", 2, int)
+FAULTHANDLER_TIMEOUT = _env("FAULTHANDLER_TIMEOUT", 120, int)
+
 # One canonical shards directory (used by both processing + training)
 SHARDS_DIR = os.environ.get("SHARDS_DIR", os.environ.get("PROCESS_OUT_DIR", "shards"))
 # Backward-compatible alias

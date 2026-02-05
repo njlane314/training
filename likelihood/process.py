@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import concurrent.futures as cf
+import faulthandler
 import gc
 import os
+import signal
+import sys
 import time
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable, Tuple
 
@@ -244,7 +249,14 @@ def write_shards_from_root():
     if idx_path.exists():
         idx_path.unlink()
 
+    try:
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(signal.SIGUSR1)
+    except Exception:
+        pass
+
     start_time = time.monotonic()
+    use_tty = sys.stdout.isatty()
 
     def format_eta(seconds: float) -> str:
         if not np.isfinite(seconds) or seconds < 0:
@@ -255,6 +267,10 @@ def write_shards_from_root():
 
     def render_progress(current: int, total: int, width: int = 40) -> None:
         if total <= 0:
+            return
+        if not use_tty:
+            if current == total:
+                print(f"Processing events: {current}/{total}", flush=True)
             return
         ratio = min(max(current / total, 0.0), 1.0)
         filled = int(ratio * width)
@@ -267,154 +283,194 @@ def write_shards_from_root():
             eta = "--:--:--"
         print(f"\rProcessing events: |{bar}| {current}/{total} ETA {eta}", end="", flush=True)
 
-    with uproot.open(cfg.ROOT_FILE) as f:
-        t = f[cfg.TREE]
+    n_decomp = int(getattr(cfg, "UPROOT_DECOMP_WORKERS", 2))
+    decomp_context = cf.ThreadPoolExecutor(max_workers=n_decomp) if n_decomp > 0 else nullcontext()
 
-        n_events = int(t.num_entries)
-        labels = np.empty(n_events, dtype=np.uint8)
-        weights = np.empty(n_events, dtype=np.float32)
+    with decomp_context as decomp:
+        with uproot.open(
+            cfg.ROOT_FILE,
+            object_cache=None,
+            array_cache=None,
+            decompression_executor=decomp if n_decomp > 0 else None,
+        ) as f:
+            t = f[cfg.TREE]
 
-        nnz = np.zeros(n_events, dtype=np.int32)
-        bad_events: list[int] = []
-        bad_logged = 0
+            labels_all = t[cfg.BR_Y].array(library="np").astype(np.uint8).reshape(-1)
+            weights_all = t[cfg.BR_WGT].array(library="np").astype(np.float32).reshape(-1)
+            n_events = int(min(labels_all.shape[0], weights_all.shape[0], int(t.num_entries)))
+            if labels_all.shape[0] != n_events or weights_all.shape[0] != n_events or int(t.num_entries) != n_events:
+                warnings.warn(
+                    f"entry count mismatch: tree={int(t.num_entries)} "
+                    f"{cfg.BR_Y}={labels_all.shape[0]} {cfg.BR_WGT}={weights_all.shape[0]}; "
+                    f"using n_events={n_events}"
+                )
 
-        shard_id = 0
-        shard_start = 0
-        coords_acc, feats_acc = [], []
-        n_acc = 0
+            labels = labels_all[:n_events].copy()
+            weights = weights_all[:n_events].copy()
 
-        progress_every = max(1, n_events // 200)
-        render_progress(0, n_events)
+            nnz = np.zeros(n_events, dtype=np.int32)
+            bad_events: list[int] = []
+            bad_logged = 0
 
-        h = int(cfg.H)
-        w = int(cfg.W)
-        thresh = float(cfg.THRESH)
+            shard_id = 0
+            shard_start = 0
+            coords_acc, feats_acc = [], []
+            n_acc = 0
 
-        for start in range(0, n_events, cfg.CHUNK_EVENTS):
-            stop = min(start + cfg.CHUNK_EVENTS, n_events)
-            a = t.arrays(
-                [cfg.BR_U, cfg.BR_V, cfg.BR_W, cfg.BR_Y, cfg.BR_WGT],
-                entry_start=start,
-                entry_stop=stop,
-                library="np",
-            )
+            progress_every = max(1, n_events // 200)
+            render_progress(0, n_events)
 
-            uu_raw, vv_raw, ww_raw = a[cfg.BR_U], a[cfg.BR_V], a[cfg.BR_W]
-            if start == 0:
-                hu, wu = _infer_hw_from_any(uu_raw, fallback_h=h, fallback_w=w)
-                hv, wv = _infer_hw_from_any(vv_raw, fallback_h=h, fallback_w=w)
-                hw_, ww_ = _infer_hw_from_any(ww_raw, fallback_h=h, fallback_w=w)
-                if (hu, wu) == (hv, wv) == (hw_, ww_) and (hu, wu) != (h, w):
-                    warnings.warn(
-                        f"cfg.H/cfg.W={h}x{w} do not match data={hu}x{wu}; "
-                        f"using inferred H/W from file"
-                    )
-                    h, w = int(hu), int(wu)
+            h = int(cfg.H)
+            w = int(cfg.W)
+            hw = int(h) * int(w)
+            thresh = float(cfg.THRESH)
 
-            y = np.asarray(a[cfg.BR_Y]).reshape(-1)
-            if y.size != (stop - start):
-                msg = f"{cfg.BR_Y} batch has size {y.size} != {stop-start}; zero-filling"
-                if cfg.STRICT_SHAPES:
-                    raise ValueError(msg)
-                if bad_logged < cfg.MAX_BAD_EVENT_LOG:
-                    warnings.warn(msg)
-                y = np.zeros(stop - start, dtype=np.uint8)
-            labels[start:stop] = y.astype(np.uint8, copy=False)
+            for start in range(0, n_events, cfg.CHUNK_EVENTS):
+                stop = min(start + cfg.CHUNK_EVENTS, n_events)
 
-            wgt = np.asarray(a[cfg.BR_WGT]).reshape(-1)
-            if wgt.size != (stop - start):
-                msg = f"{cfg.BR_WGT} batch has size {wgt.size} != {stop-start}; one-filling"
-                if cfg.STRICT_SHAPES:
-                    raise ValueError(msg)
-                if bad_logged < cfg.MAX_BAD_EVENT_LOG:
-                    warnings.warn(msg)
-                wgt = np.ones(stop - start, dtype=np.float32)
-            weights[start:stop] = wgt.astype(np.float32, copy=False)
-
-            uu, bad_u = _flatten_plane_batch(
-                uu_raw, h=h, w=w, name=cfg.BR_U, strict=cfg.STRICT_SHAPES
-            )
-            vv, bad_v = _flatten_plane_batch(
-                vv_raw, h=h, w=w, name=cfg.BR_V, strict=cfg.STRICT_SHAPES
-            )
-            ww, bad_w = _flatten_plane_batch(
-                ww_raw, h=h, w=w, name=cfg.BR_W, strict=cfg.STRICT_SHAPES
-            )
-            bad_batch = bad_u | bad_v | bad_w
-
-            for j in range(stop - start):
-                gi = start + j
+                faulthandler.dump_traceback_later(int(getattr(cfg, "FAULTHANDLER_TIMEOUT", 120)), repeat=False)
                 try:
-                    c, fe, nnz_true = event_to_sparse(
-                        uu[j], vv[j], ww[j], width=w, thresh=thresh
+                    a = t.arrays(
+                        [cfg.BR_U, cfg.BR_V, cfg.BR_W],
+                        entry_start=start,
+                        entry_stop=stop,
+                        library="np",
                     )
-                except Exception as e:
-                    if cfg.STRICT_SHAPES:
-                        raise
-                    c, fe, nnz_true = _DUMMY_COORDS, _DUMMY_FEATS, 0
-                    bad_batch[j] = True
-                    if bad_logged < cfg.MAX_BAD_EVENT_LOG:
-                        warnings.warn(f"event {gi}: event_to_sparse failed ({type(e).__name__}: {e}); zero-filling")
-                        bad_logged += 1
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
 
-                nnz[gi] = int(nnz_true)
-                if bad_batch[j]:
-                    bad_events.append(int(gi))
+                uu_raw, vv_raw, ww_raw = a[cfg.BR_U], a[cfg.BR_V], a[cfg.BR_W]
+                if start == 0:
+                    hu, wu = _infer_hw_from_any(uu_raw, fallback_h=h, fallback_w=w)
+                    hv, wv = _infer_hw_from_any(vv_raw, fallback_h=h, fallback_w=w)
+                    hw_, ww_ = _infer_hw_from_any(ww_raw, fallback_h=h, fallback_w=w)
+                    if (hu, wu) == (hv, wv) == (hw_, ww_) and (hu, wu) != (h, w):
+                        warnings.warn(
+                            f"cfg.H/cfg.W={h}x{w} do not match data={hu}x{wu}; "
+                            f"using inferred H/W from file"
+                        )
+                        h, w = int(hu), int(wu)
+                        hw = int(h) * int(w)
 
-                coords_acc.append(c)
-                feats_acc.append(fe)
-                n_acc += 1
+                for j in range(stop - start):
+                    gi = start + j
+                    bad_evt = False
 
-                if n_acc == cfg.SHARD_EVENTS:
-                    coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
-                    _atomic_torch_save(
-                        {
-                            "start_event": int(shard_start),
-                            "n_events": int(n_acc),
-                            "coords": coords_t,
-                            "feats": feats_t,
-                            "starts": starts_t,
-                        },
-                        out_dir / f"shard_{shard_id:05d}.pt",
-                    )
-                    shard_id += 1
-                    shard_start = gi + 1
-                    coords_acc.clear()
-                    feats_acc.clear()
-                    n_acc = 0
-                    gc.collect()
+                    try:
+                        u = np.asarray(uu_raw[j]).reshape(-1)
+                        if u.size != hw:
+                            raise ValueError(f"{cfg.BR_U}[{gi}] size {u.size} != {hw} (H*W)")
+                    except Exception as e:
+                        if cfg.STRICT_SHAPES:
+                            raise
+                        bad_evt = True
+                        if bad_logged < cfg.MAX_BAD_EVENT_LOG:
+                            warnings.warn(f"{cfg.BR_U}[{gi}] malformed ({type(e).__name__}: {e}); zero-filling")
+                            bad_logged += 1
 
-                if (gi + 1) % progress_every == 0 or (gi + 1) == n_events:
-                    render_progress(gi + 1, n_events)
+                    try:
+                        v = np.asarray(vv_raw[j]).reshape(-1)
+                        if v.size != hw:
+                            raise ValueError(f"{cfg.BR_V}[{gi}] size {v.size} != {hw} (H*W)")
+                    except Exception as e:
+                        if cfg.STRICT_SHAPES:
+                            raise
+                        bad_evt = True
+                        if bad_logged < cfg.MAX_BAD_EVENT_LOG:
+                            warnings.warn(f"{cfg.BR_V}[{gi}] malformed ({type(e).__name__}: {e}); zero-filling")
+                            bad_logged += 1
 
-        if n_acc:
-            coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
+                    try:
+                        wplane = np.asarray(ww_raw[j]).reshape(-1)
+                        if wplane.size != hw:
+                            raise ValueError(f"{cfg.BR_W}[{gi}] size {wplane.size} != {hw} (H*W)")
+                    except Exception as e:
+                        if cfg.STRICT_SHAPES:
+                            raise
+                        bad_evt = True
+                        if bad_logged < cfg.MAX_BAD_EVENT_LOG:
+                            warnings.warn(f"{cfg.BR_W}[{gi}] malformed ({type(e).__name__}: {e}); zero-filling")
+                            bad_logged += 1
+
+                    if bad_evt:
+                        c, fe, nnz_true = _DUMMY_COORDS, _DUMMY_FEATS, 0
+                        bad_events.append(int(gi))
+                    else:
+                        try:
+                            c, fe, nnz_true = event_to_sparse(u, v, wplane, width=w, thresh=thresh)
+                        except Exception as e:
+                            if cfg.STRICT_SHAPES:
+                                raise
+                            c, fe, nnz_true = _DUMMY_COORDS, _DUMMY_FEATS, 0
+                            bad_events.append(int(gi))
+                            if bad_logged < cfg.MAX_BAD_EVENT_LOG:
+                                warnings.warn(
+                                    f"event {gi}: event_to_sparse failed ({type(e).__name__}: {e}); zero-filling"
+                                )
+                                bad_logged += 1
+
+                    nnz[gi] = int(nnz_true)
+
+                    coords_acc.append(c)
+                    feats_acc.append(fe)
+                    n_acc += 1
+
+                    if n_acc == cfg.SHARD_EVENTS:
+                        coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
+                        _atomic_torch_save(
+                            {
+                                "start_event": int(shard_start),
+                                "n_events": int(n_acc),
+                                "coords": coords_t,
+                                "feats": feats_t,
+                                "starts": starts_t,
+                            },
+                            out_dir / f"shard_{shard_id:05d}.pt",
+                        )
+                        shard_id += 1
+                        shard_start = gi + 1
+                        coords_acc.clear()
+                        feats_acc.clear()
+                        n_acc = 0
+                        gc.collect()
+
+                    if (gi + 1) % progress_every == 0 or (gi + 1) == n_events:
+                        render_progress(gi + 1, n_events)
+
+            if n_acc:
+                coords_t, feats_t, starts_t = pack_events(coords_acc, feats_acc)
+                _atomic_torch_save(
+                    {
+                        "start_event": int(shard_start),
+                        "n_events": int(n_acc),
+                        "coords": coords_t,
+                        "feats": feats_t,
+                        "starts": starts_t,
+                    },
+                    out_dir / f"shard_{shard_id:05d}.pt",
+                )
+                shard_id += 1
+
             _atomic_torch_save(
                 {
-                    "start_event": int(shard_start),
-                    "n_events": int(n_acc),
-                    "coords": coords_t,
-                    "feats": feats_t,
-                    "starts": starts_t,
+                    "H": int(h),
+                    "W": int(w),
+                    "shard_events": int(cfg.SHARD_EVENTS),
+                    "n_events": int(n_events),
+                    "labels": torch.from_numpy(labels),
+                    "weights": torch.from_numpy(weights),
+                    "nnz": torch.from_numpy(nnz),
+                    "bad_events": torch.tensor(bad_events, dtype=torch.int64),
+                    "branches": {
+                        "y": cfg.BR_Y,
+                        "u": cfg.BR_U,
+                        "v": cfg.BR_V,
+                        "w": cfg.BR_W,
+                        "wgt": cfg.BR_WGT,
+                    },
                 },
-                out_dir / f"shard_{shard_id:05d}.pt",
+                idx_path,
             )
-            shard_id += 1
-
-        _atomic_torch_save(
-            {
-                "H": int(h),
-                "W": int(w),
-                "shard_events": int(cfg.SHARD_EVENTS),
-                "n_events": int(n_events),
-                "labels": torch.from_numpy(labels),
-                "weights": torch.from_numpy(weights),
-                "nnz": torch.from_numpy(nnz),
-                "bad_events": torch.tensor(bad_events, dtype=torch.int64),
-                "branches": {"y": cfg.BR_Y, "u": cfg.BR_U, "v": cfg.BR_V, "w": cfg.BR_W, "wgt": cfg.BR_WGT},
-            },
-            idx_path,
-        )
 
     print()
     print(f"wrote {shard_id} shards to {out_dir} (events={n_events})")
