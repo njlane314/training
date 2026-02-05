@@ -125,7 +125,7 @@ def train_llr():
     #   VAL_NUM_BATCHES   : average validation loss over N batches. Default: 1
     #   VAL_CACHE_BATCHES : prefetch N validation batches at startup (RAM) to avoid shard I/O later. Default: 0
     val_every = int(getattr(cfg, "VAL_EVERY", 200))
-    val_num_batches = int(getattr(cfg, "VAL_NUM_BATCHES", 1))
+    val_num_batches = int(getattr(cfg, "VAL_BATCHES", getattr(cfg, "VAL_NUM_BATCHES", 1)))
     val_cache_batches = int(getattr(cfg, "VAL_CACHE_BATCHES", 0))
     if val_every < 0:
         raise ValueError("VAL_EVERY must be >= 0")
@@ -164,6 +164,13 @@ def train_llr():
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # Line-buffered logging can be slow on network filesystems. Use a larger buffer and flush occasionally.
     log_flush_every = int(getattr(cfg, "LOG_FLUSH_EVERY", 50))
+    train_diagnostics_every = int(getattr(cfg, "TRAIN_DIAGNOSTICS_EVERY", 0))
+
+    if log_flush_every < 0:
+        raise ValueError("LOG_FLUSH_EVERY must be >= 0")
+    if train_diagnostics_every < 0:
+        raise ValueError("TRAIN_DIAGNOSTICS_EVERY must be >= 0")
+
     log_f = log_path.open("w", buffering=64 * 1024)
     log_f.write("#step\tis_val\tloss\n")
 
@@ -214,7 +221,7 @@ def train_llr():
         opt.zero_grad(set_to_none=True)
         loss.backward()
 
-        if step % 200 == 0:
+        if train_diagnostics_every > 0 and step % train_diagnostics_every == 0:
             with torch.no_grad():
                 print("logits mean/std:", logits.mean().item(), logits.std().item())
 
