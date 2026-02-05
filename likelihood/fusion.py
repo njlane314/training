@@ -28,6 +28,13 @@ class ViewAttentionPool(nn.Module):
 
         if mask is not None:
             m = mask.to(dtype=torch.bool, device=Z.device)
+            # If an event has *no* available views (all False), masking would
+            # zero-out attention weights and kill gradients into Z/backbone.
+            # Fall back to treating all views as available for those rows.
+            none = ~m.any(dim=1, keepdim=True)  # [B,1]
+            if none.any():
+                m = m.clone()
+                m[none.expand_as(m)] = True
             s = s.masked_fill(~m, -1e9)
         else:
             m = None

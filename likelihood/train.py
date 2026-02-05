@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from typing import Optional
 
 import MinkowskiEngine as ME
 
@@ -23,11 +24,51 @@ def train_llr():
     meta = torch.load(f"{cfg.SHARDS_DIR}/index.pt", map_location="cpu")
     n = int(meta["n_events"])
     rng = np.random.default_rng(cfg.SEED)
-    perm = rng.permutation(n)
-    n_val = int(cfg.VAL_FRACTION * n)
+    labels_all = np.asarray(meta["labels"], dtype=np.uint8).reshape(-1)
 
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
+    # If shards were created with process.py, index.pt contains nnz per event.
+    # Training on nnz==0 events + masking all views can yield exactly-zero pooled
+    # embeddings and (with perfectly balanced batches) exactly-zero gradients.
+    nnz_all: Optional[np.ndarray] = None
+    if "nnz" in meta and meta["nnz"] is not None:
+        if isinstance(meta["nnz"], torch.Tensor):
+            nnz_all = meta["nnz"].to(dtype=torch.int64).cpu().numpy().reshape(-1)
+        else:
+            nnz_all = np.asarray(meta["nnz"], dtype=np.int64).reshape(-1)
+
+    if nnz_all is not None:
+        if nnz_all.shape[0] != n:
+            raise ValueError(f"index.pt nnz has len={nnz_all.shape[0]} but n_events={n}")
+
+        good = nnz_all > 0
+        idx_all = np.flatnonzero(good)
+        dropped = int(n - idx_all.size)
+        print(f"[data] keeping nnz>0 events: {idx_all.size}/{n} (dropped {dropped})")
+        if idx_all.size == 0:
+            raise ValueError(
+                "All events have nnz==0 after sparsification. "
+                "Check THRESH / branch names / shard generation (bad_events) in index.pt."
+            )
+
+        # Split only over non-empty events to guarantee at least one available view per event.
+        perm = rng.permutation(idx_all.size)
+        idx_perm = idx_all[perm]
+        n_val = int(cfg.VAL_FRACTION * idx_perm.size)
+        val_idx = idx_perm[:n_val]
+        train_idx = idx_perm[n_val:]
+
+        # BalancedBatchSampler requires both classes in the training split.
+        labs_train = labels_all[train_idx]
+        if labs_train.min() == labs_train.max():
+            raise ValueError(
+                "After filtering nnz>0, the training split contains only one class. "
+                "Lower THRESH or inspect index.pt (labels/nnz/bad_events)."
+            )
+    else:
+        perm = rng.permutation(n)
+        n_val = int(cfg.VAL_FRACTION * n)
+        val_idx = perm[:n_val]
+        train_idx = perm[n_val:]
 
     ds_train = ShardDataset(cfg.SHARDS_DIR, train_idx, cache_size=2)
     ds_val = ShardDataset(cfg.SHARDS_DIR, val_idx, cache_size=2)
