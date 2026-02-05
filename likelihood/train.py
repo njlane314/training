@@ -16,6 +16,15 @@ def poly_lr(step, max_steps, lr0, power):
     t = min(step / max_steps, 1.0)
     return lr0 * (1.0 - t) ** power
 
+def _capture_random_state():
+    state = {
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
 def train_llr():
     torch.manual_seed(cfg.SEED)
     np.random.seed(cfg.SEED)
@@ -116,6 +125,23 @@ def train_llr():
     log_f = log_path.open("w", buffering=1)
     log_f.write("#step\tis_val\tloss\n")
 
+    ckpt_path = Path(cfg.CHECKPOINT_PATH)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    initial_random_state = _capture_random_state()
+    if cfg.CHECKPOINT_EVERY > 0:
+        torch.save(
+            {
+                "step": 0,
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "initial_random_state": initial_random_state,
+                "random_state": initial_random_state,
+            },
+            ckpt_path,
+        )
+        print(f"[ckpt] saved initial state -> {ckpt_path}")
+
     for step in range(1, cfg.MAX_STEPS + 1):
         model.train()
         coords_by_plane, feats_by_plane, y, available_mask = next(it)
@@ -200,5 +226,18 @@ def train_llr():
             val_loss = tot / max(cnt, 1)
             print(f"[val] step {step:7d}  loss {val_loss:.4f}")
             log_f.write(f"{step}\t1\t{val_loss:.8g}\n")
+
+        if cfg.CHECKPOINT_EVERY > 0 and step % cfg.CHECKPOINT_EVERY == 0:
+            torch.save(
+                {
+                    "step": step,
+                    "model": model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "initial_random_state": initial_random_state,
+                    "random_state": _capture_random_state(),
+                },
+                ckpt_path,
+            )
+            print(f"[ckpt] saved step {step:7d} -> {ckpt_path}")
 
     log_f.close()
