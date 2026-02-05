@@ -224,7 +224,7 @@ If the model cannot overfit 64 fixed events, there is a bug in data or gradients
 | `NUM_WORKERS` | `8` | DataLoader workers |
 | `SEED` | `12345` | Random seed |
 | `VAL_FRAC` | `0.1` | Validation fraction |
-| `OUT` | `checkpoint.pt` | Checkpoint path |
+| `OUT` | `checkpoints/checkpoint.pt` | Checkpoint base path (step suffix is appended) |
 | `BASE_FILTERS` | `32` | Base feature width |
 | `NUM_STRIDES` | `3` | Encoder/decoder depth |
 | `DROPOUT` | `0.2` | Dropout probability |
@@ -243,7 +243,7 @@ export ADC_SIGNLOG=0
 export BATCH=32
 export EPOCHS=20
 export LR=3e-3
-export OUT=checkpoint.pt
+export OUT=checkpoints/checkpoint.pt
 ```
 
 ## Workflow notes
