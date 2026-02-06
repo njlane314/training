@@ -118,7 +118,11 @@ class ResBlock(nn.Module):
         self.n1 = SparseLayerNorm(cout)
         self.conv2 = _subm_conv(cout, cout, kernel_size=3, dimension=2, bias=False)
         self.n2 = SparseLayerNorm(cout)
-        self.act = ME.MinkowskiReLU(inplace=True)
+        # NOTE:
+        # In-place activations are a common source of surprises for gradient-based
+        # attribution methods (multiple backward passes / hooks / captum-style tools).
+        # Keeping this non-inplace makes attribution maps stable.
+        self.act = ME.MinkowskiReLU(inplace=False)
         self.proj = None
         if cin != cout:
             self.proj = nn.Sequential(
@@ -138,7 +142,7 @@ class Down(nn.Sequential):
         super().__init__(
             ME.MinkowskiConvolution(cin, cout, kernel_size=2, stride=2, dimension=2, bias=False),
             SparseLayerNorm(cout),
-            ME.MinkowskiReLU(inplace=True),
+            ME.MinkowskiReLU(inplace=False),
         )
 
 
@@ -153,7 +157,7 @@ class SparseResNet2D(nn.Module):
         self.stem = nn.Sequential(
             _subm_conv(in_ch, base, kernel_size=3, dimension=2, bias=False),
             SparseLayerNorm(base),
-            ME.MinkowskiReLU(inplace=True),
+            ME.MinkowskiReLU(inplace=False),
         )
         self.blocks = nn.ModuleList()
         self.downs = nn.ModuleList()
