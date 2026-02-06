@@ -18,7 +18,9 @@ class ViewAttentionPool(nn.Module):
         super().__init__()
         self.score = nn.Sequential(
             nn.Linear(d, d),
-            nn.ReLU(inplace=True),
+            # In-place ReLU can interfere with some attribution methods that rely on
+            # hooks / multiple backward passes.
+            nn.ReLU(inplace=False),
             nn.Linear(d, 1),
         )
 
