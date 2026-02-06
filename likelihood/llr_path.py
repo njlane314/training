@@ -43,6 +43,54 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+def _preload_conda_cxx_runtime() -> None:
+    """
+    Work around heterogeneous cluster setups where an older system libstdc++
+    (e.g. /lib64/libstdc++.so.6) gets loaded first and then breaks PyROOT/ROOT,
+    producing errors like:
+        GLIBCXX_3.4.30 not found (required by .../libRIO.so)
+
+    We proactively dlopen() the libstdc++ shipped in the active conda env with
+    RTLD_GLOBAL *before* importing torch/MinkowskiEngine/ROOT so that subsequent
+    dlopen() calls reuse the newer C++ runtime.
+
+    Disable by setting:
+      LLR_DISABLE_CONDA_CXX_PRELOAD=1
+    """
+    if os.environ.get("LLR_DISABLE_CONDA_CXX_PRELOAD", "").strip().lower() in {"1", "true", "yes"}:
+        return
+
+    try:
+        import ctypes
+    except Exception:
+        return
+
+    # Prefer CONDA_PREFIX (activation), otherwise fall back to sys.prefix.
+    prefix = os.environ.get("CONDA_PREFIX") or sys.prefix
+    if not prefix:
+        return
+
+    cand_libdirs = [Path(prefix) / "lib", Path(prefix) / "lib64"]
+    # Load libgcc_s first, then libstdc++.
+    libs = ("libgcc_s.so.1", "libstdc++.so.6")
+
+    for libdir in cand_libdirs:
+        if not libdir.is_dir():
+            continue
+        for lib in libs:
+            p = libdir / lib
+            if not p.exists():
+                continue
+            try:
+                ctypes.CDLL(str(p), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                # Ignore and let ROOT import surface the real failure mode if any.
+                pass
+
+
+# Must run before importing torch / MinkowskiEngine / ROOT.
+_preload_conda_cxx_runtime()
+
 import numpy as np
 import torch
 import torch.nn as nn
