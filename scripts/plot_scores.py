@@ -11,6 +11,8 @@ Default behavior:
   - Uses nominal event weights from index.pt
   - Includes all events (including nnz==0) unless --drop-empty is set
   - Plots probability score = sigmoid(logit) on [0,1] with density normalization
+  - Also writes a separate *logit* distribution plot when --score=prob with a
+    dynamic x-range based on observed logits: <out_stem>_logit<out_suffix>
 
 Examples:
   python plot_scores.py
@@ -115,6 +117,45 @@ def _build_model(device: torch.device, planes: Tuple[str, ...] = ("u", "v", "w")
     backbone = make_backbone(cfg.BACKBONE, in_ch=2, embed_dim=cfg.EMBED_DIM).to(device)
     model = MultiViewSetClassifier(backbone=backbone, embed_dim=cfg.EMBED_DIM, plane_names=planes).to(device)
     return model
+
+
+def _make_edges(xmin: float, xmax: float, bins: int) -> Tuple[np.ndarray, float]:
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
+        raise ValueError(f"Invalid histogram range: xmin={xmin}, xmax={xmax}")
+    edges = np.linspace(float(xmin), float(xmax), int(bins) + 1, dtype=np.float64)
+    bin_w = float(edges[1] - edges[0])
+    return edges, bin_w
+
+
+def _plot_two_class_hist(
+    centers: np.ndarray,
+    hb: np.ndarray,
+    hs: np.ndarray,
+    *,
+    xlabel: str,
+    ylabel: str,
+    xmin: float,
+    xmax: float,
+    logy: bool,
+    label_bkg: str,
+    label_sig: str,
+    out_path: Path,
+) -> None:
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.step(centers, hb, where="mid", label=label_bkg)
+    ax.step(centers, hs, where="mid", label=label_sig)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if logy:
+        ax.set_yscale("log")
+    ax.set_xlim(xmin, xmax)
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.3)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def main():
@@ -262,11 +303,7 @@ def main():
     else:
         xmin, xmax = float(args.xmin), float(args.xmax)
 
-    if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
-        raise ValueError(f"Invalid histogram range: xmin={xmin}, xmax={xmax}")
-
-    edges = np.linspace(xmin, xmax, bins + 1, dtype=np.float64)
-    bin_w = float(edges[1] - edges[0])
+    edges, bin_w = _make_edges(xmin, xmax, bins)
 
     hs = np.zeros(bins, dtype=np.float64)
     hb = np.zeros(bins, dtype=np.float64)
@@ -275,6 +312,12 @@ def main():
     n_bkg = 0
     sumw_sig = 0.0
     sumw_bkg = 0.0
+    logit_min = np.inf
+    logit_max = -np.inf
+    logit_plot = args.score == "prob"
+    logit_out = []
+    y_logit_out = []
+    w_logit_out = []
 
     # Optional per-event outputs
     save_arrays = bool(args.save_npz)
@@ -304,15 +347,17 @@ def main():
 
             logits = model(inputs, available_mask=available_mask.to(device, non_blocking=True)).squeeze(1)
 
-            if args.score == "prob":
-                score = torch.sigmoid(logits)
-            else:
-                score = logits
+            prob = torch.sigmoid(logits)
+            score = prob if args.score == "prob" else logits
 
             score_np = score.detach().cpu().numpy().astype(np.float64, copy=False)
+            logit_np = logits.detach().cpu().numpy().astype(np.float64, copy=False)
             y_np = y.detach().cpu().numpy().astype(np.float64, copy=False)
             w_np = w_use.detach().cpu().numpy().astype(np.float64, copy=False)
             gi_np = gi.detach().cpu().numpy().astype(np.int64, copy=False)
+            if logit_np.size > 0:
+                logit_min = min(logit_min, float(logit_np.min()))
+                logit_max = max(logit_max, float(logit_np.max()))
 
             sig = y_np > 0.5
             bkg = ~sig
@@ -326,6 +371,11 @@ def main():
                 hb += np.histogram(score_np[bkg], bins=edges, weights=w_np[bkg])[0]
                 n_bkg += int(bkg.sum())
                 sumw_bkg += float(w_np[bkg].sum())
+
+            if logit_plot:
+                logit_out.append(logit_np)
+                y_logit_out.append(y_np)
+                w_logit_out.append(w_np)
 
             if save_arrays:
                 scores_out.append(score_np)
@@ -342,35 +392,72 @@ def main():
 
     centers = 0.5 * (edges[:-1] + edges[1:])
 
-    # Plot
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-
-    ax.step(centers, hb, where="mid", label=f"Background (N={n_bkg}, sumw={sumw_bkg:.3g})")
-    ax.step(centers, hs, where="mid", label=f"Signal (N={n_sig}, sumw={sumw_sig:.3g})")
-
-    if args.score == "prob":
-        ax.set_xlabel("Score = sigmoid(logit)")
-    else:
-        ax.set_xlabel("Score = logit")
-
-    if args.norm == "density":
-        ax.set_ylabel("Density")
-    else:
-        ax.set_ylabel("Events" if args.unweighted else "Sum of weights")
-
-    if args.logy:
-        ax.set_yscale("log")
-
-    ax.set_xlim(xmin, xmax)
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
-
     out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    label_bkg = f"Background (N={n_bkg}, sumw={sumw_bkg:.3g})"
+    label_sig = f"Signal (N={n_sig}, sumw={sumw_sig:.3g})"
+    ylabel = "Density" if args.norm == "density" else ("Events" if args.unweighted else "Sum of weights")
+    xlabel = "Score = sigmoid(logit)" if args.score == "prob" else "Score = logit"
+
+    _plot_two_class_hist(
+        centers,
+        hb,
+        hs,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        xmin=xmin,
+        xmax=xmax,
+        logy=bool(args.logy),
+        label_bkg=label_bkg,
+        label_sig=label_sig,
+        out_path=out_path,
+    )
     print(f"[out] wrote {out_path}")
+
+    # Extra: always write a separate logit distribution plot when the primary score is prob
+    if args.score == "prob":
+        if not np.isfinite(logit_min) or not np.isfinite(logit_max):
+            raise RuntimeError("Logit range is undefined; check input data.")
+        if logit_max <= logit_min:
+            delta = 1.0 if logit_min == 0.0 else abs(logit_min) * 0.1
+            logit_min -= delta
+            logit_max += delta
+
+        edges_logit, bin_w_logit = _make_edges(logit_min, logit_max, bins)
+        centers_logit = 0.5 * (edges_logit[:-1] + edges_logit[1:])
+
+        if not logit_out:
+            raise RuntimeError("No logits collected for logit plot.")
+
+        logit_all = np.concatenate(logit_out, axis=0)
+        y_logit_all = np.concatenate(y_logit_out, axis=0)
+        w_logit_all = np.concatenate(w_logit_out, axis=0)
+        sig_logit = y_logit_all > 0.5
+        bkg_logit = ~sig_logit
+
+        hs_logit = np.histogram(logit_all[sig_logit], bins=edges_logit, weights=w_logit_all[sig_logit])[0]
+        hb_logit = np.histogram(logit_all[bkg_logit], bins=edges_logit, weights=w_logit_all[bkg_logit])[0]
+
+        if args.norm == "density":
+            if hs_logit.sum() > 0:
+                hs_logit = hs_logit / (hs_logit.sum() * bin_w_logit)
+            if hb_logit.sum() > 0:
+                hb_logit = hb_logit / (hb_logit.sum() * bin_w_logit)
+
+        out_logit = out_path.with_name(out_path.stem + "_logit" + out_path.suffix)
+        _plot_two_class_hist(
+            centers_logit,
+            hb_logit,
+            hs_logit,
+            xlabel="Logit",
+            ylabel=ylabel,
+            xmin=float(logit_min),
+            xmax=float(logit_max),
+            logy=bool(args.logy),
+            label_bkg=label_bkg,
+            label_sig=label_sig,
+            out_path=out_logit,
+        )
+        print(f"[out] wrote {out_logit}")
 
     if save_arrays:
         scores_all = np.concatenate(scores_out, axis=0) if scores_out else np.zeros((0,), dtype=np.float64)
