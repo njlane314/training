@@ -363,6 +363,29 @@ def _attr_log_norm(att: np.ndarray) -> Optional[colors.Normalize]:
     return colors.LogNorm(vmin=vmin, vmax=vmax)
 
 
+def _global_log_norm(arrs: Sequence[np.ndarray], *, signed: bool) -> Optional[colors.Normalize]:
+    flat = np.concatenate([a[np.isfinite(a)].reshape(-1) for a in arrs])
+    if flat.size == 0:
+        return None
+    if signed and np.any(flat < 0):
+        vmax = float(np.max(np.abs(flat)))
+        if vmax <= 0:
+            return None
+        linthresh = max(vmax * 1e-3, 1e-6)
+        return colors.SymLogNorm(linthresh=linthresh, vmin=-vmax, vmax=vmax)
+
+    positive = flat[flat > 0]
+    if positive.size == 0:
+        return None
+    vmin = float(np.percentile(positive, 1.0))
+    vmax = float(np.percentile(positive, 99.5))
+    if vmin <= 0:
+        vmin = float(np.min(positive))
+    if vmax <= vmin:
+        vmax = float(np.max(positive))
+    return colors.LogNorm(vmin=vmin, vmax=vmax)
+
+
 def _crop_box_from_planes(imgs: Dict[str, np.ndarray], margin: int) -> Optional[Tuple[slice, slice]]:
     ys: List[int] = []
     xs: List[int] = []
@@ -394,30 +417,53 @@ def plot_event_and_attribution(
     if crop:
         crop_slices = _crop_box_from_planes(images, margin=crop_margin)
 
-    fig, axes = plt.subplots(nrows=len(PLANES), ncols=2, figsize=(12, 15), constrained_layout=True)
-    fig.suptitle(title)
-
-    for i, name in enumerate(PLANES):
+    img_views: List[np.ndarray] = []
+    attr_views: List[np.ndarray] = []
+    for name in PLANES:
         img = images[name]
         att = attrs[name]
         if crop_slices is not None:
             img = img[crop_slices]
             att = att[crop_slices]
+        img_views.append(img)
+        attr_views.append(att)
+
+    img_norm = _global_log_norm(img_views, signed=False)
+    attr_norm = _global_log_norm(attr_views, signed=True)
+
+    fig, axes = plt.subplots(nrows=len(PLANES), ncols=2, figsize=(12, 15), constrained_layout=True)
+    fig.suptitle(title)
+
+    for i, name in enumerate(PLANES):
+        img = img_views[i]
+        att = attr_views[i]
 
         vmax0 = _auto_vmax(img)
         vmax1 = _auto_vmax(att)
-        attr_norm = _attr_log_norm(att)
 
         ax0 = axes[i, 0]
         ax1 = axes[i, 1]
 
-        im0 = ax0.imshow(img, origin="lower", vmax=vmax0, interpolation="nearest")
+        im0 = ax0.imshow(
+            img,
+            origin="lower",
+            vmax=None if img_norm is not None else vmax0,
+            interpolation="nearest",
+            norm=img_norm,
+        )
         ax0.set_title(f"{name}: event (feature)")
         ax0.set_xlabel("x")
         ax0.set_ylabel("y")
         fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
 
-        ax1.imshow(img, origin="lower", cmap="gray", vmax=vmax0, interpolation="nearest")
+        ax1.imshow(
+            img,
+            origin="lower",
+            cmap="gray",
+            vmax=None if img_norm is not None else vmax0,
+            interpolation="nearest",
+            norm=img_norm,
+        )
         im1 = ax1.imshow(
             att,
             origin="lower",
