@@ -329,6 +329,35 @@ def compute_gradxinput_attribution(
     return images, attrs, float(score)
 
 
+def compute_event_images(
+    coords: np.ndarray,
+    feats: np.ndarray,
+    *,
+    h: int,
+    w: int,
+    channel: int = 1,
+) -> Dict[str, np.ndarray]:
+    """
+    Compute per-plane dense images for a given feature channel.
+
+    Returns:
+      - images: dict plane -> dense HxW image (feature[channel])
+    """
+    coords_by_plane, feats_by_plane, _y, _available_mask = collate_me_fusion(
+        [(coords, feats, 0.0)],
+        plane_names=PLANES,
+    )
+
+    images: Dict[str, np.ndarray] = {}
+    for name in PLANES:
+        C = coords_by_plane[name]
+        F = feats_by_plane[name]
+        f = F[:, int(channel)]
+        images[name] = _dense_from_sparse(C, f, h=h, w=w)
+
+    return images
+
+
 # -------------------------
 # Plotting
 # -------------------------
@@ -488,6 +517,57 @@ def plot_event_and_attribution(
     plt.close(fig)
 
 
+def plot_event_only(
+    images: Dict[str, np.ndarray],
+    *,
+    out: Optional[str],
+    title: str,
+    crop: bool,
+    crop_margin: int,
+) -> None:
+    crop_slices: Optional[Tuple[slice, slice]] = None
+    if crop:
+        crop_slices = _crop_box_from_planes(images, margin=crop_margin)
+
+    img_views: List[np.ndarray] = []
+    for name in PLANES:
+        img = images[name]
+        if crop_slices is not None:
+            img = img[crop_slices]
+        img_views.append(img)
+
+    img_norm = _global_log_norm(img_views, signed=False)
+
+    fig, axes = plt.subplots(nrows=len(PLANES), ncols=1, figsize=(7, 15), constrained_layout=True)
+    fig.suptitle(title)
+
+    for i, name in enumerate(PLANES):
+        img = img_views[i]
+        vmax0 = _auto_vmax(img)
+        ax0 = axes[i]
+        im0 = ax0.imshow(
+            img,
+            origin="lower",
+            vmax=None if img_norm is not None else vmax0,
+            interpolation="nearest",
+            norm=img_norm,
+        )
+        ax0.set_title(f"{name}: event (feature)")
+        ax0.set_xlabel("x")
+        ax0.set_ylabel("y")
+        fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+
+    if out:
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+        print(f"[saved] {out_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
 # -------------------------
 # Main
 # -------------------------
@@ -514,6 +594,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no_nnz_filter", action="store_true", help="Do not restrict sampling to nnz>0 events.")
     ap.add_argument("--crop", action="store_true", help="Crop plots to ROI around hits (recommended).")
     ap.add_argument("--crop_margin", type=int, default=10, help="Margin (pixels) when --crop is enabled.")
+    ap.add_argument("--signal_only", action="store_true", help="Plot only the event display (no attributions).")
     args = ap.parse_args(argv)
 
     shards_dir = str(args.shards_dir)
@@ -558,27 +639,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     coords, feats, _y = ds_one[0]
 
     channel = 0 if args.channel == "occ" else 1
-    images, attrs, score2 = compute_gradxinput_attribution(
-        model,
-        coords,
-        feats,
-        device=device,
-        h=h,
-        w=w,
-        channel=channel,
-        signed=bool(args.signed),
-    )
+    if args.signal_only:
+        images = compute_event_images(
+            coords,
+            feats,
+            h=h,
+            w=w,
+            channel=channel,
+        )
+        title = f"event {gi}  (selected={score:.4f})  true_label={meta_out['true_label']}"
+        out = None if bool(args.no_out) else str(args.out)
+        plot_event_only(
+            images,
+            out=out,
+            title=title,
+            crop=bool(args.crop),
+            crop_margin=int(args.crop_margin),
+        )
+    else:
+        images, attrs, score2 = compute_gradxinput_attribution(
+            model,
+            coords,
+            feats,
+            device=device,
+            h=h,
+            w=w,
+            channel=channel,
+            signed=bool(args.signed),
+        )
 
-    title = f"event {gi}  model score={score2:.4f}  (selected={score:.4f})  true_label={meta_out['true_label']}"
-    out = None if bool(args.no_out) else str(args.out)
-    plot_event_and_attribution(
-        images,
-        attrs,
-        out=out,
-        title=title,
-        crop=bool(args.crop),
-        crop_margin=int(args.crop_margin),
-    )
+        title = (
+            f"event {gi}  model score={score2:.4f}  (selected={score:.4f})"
+            f"  true_label={meta_out['true_label']}"
+        )
+        out = None if bool(args.no_out) else str(args.out)
+        plot_event_and_attribution(
+            images,
+            attrs,
+            out=out,
+            title=title,
+            crop=bool(args.crop),
+            crop_margin=int(args.crop_margin),
+        )
     return 0
 
 
