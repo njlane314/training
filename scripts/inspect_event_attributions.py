@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib import colors
 import numpy as np
 import torch
 import torch.utils.data
@@ -155,7 +156,7 @@ def pick_random_high_score_event(
     num_samples: int,
     min_score: float,
     topk_fallback: int,
-    seed: int,
+    seed: Optional[int],
     batch_size: int,
     num_workers: int,
     device: torch.device,
@@ -190,7 +191,7 @@ def pick_random_high_score_event(
     if pool.size == 0:
         raise ValueError("No eligible events in the pool to sample from (pool.size==0).")
 
-    rng = np.random.default_rng(int(seed))
+    rng = np.random.default_rng(None if seed is None else int(seed))
     k = int(min(num_samples, pool.size))
     chosen = rng.choice(pool, size=k, replace=False)  # global ids
 
@@ -339,6 +340,29 @@ def _auto_vmax(x: np.ndarray, q: float = 99.5) -> Optional[float]:
     return float(np.percentile(flat, q))
 
 
+def _attr_log_norm(att: np.ndarray) -> Optional[colors.Normalize]:
+    flat = att[np.isfinite(att)]
+    if flat.size == 0:
+        return None
+    if np.any(flat < 0):
+        vmax = float(np.max(np.abs(flat)))
+        if vmax <= 0:
+            return None
+        linthresh = max(vmax * 1e-3, 1e-6)
+        return colors.SymLogNorm(linthresh=linthresh, vmin=-vmax, vmax=vmax)
+
+    positive = flat[flat > 0]
+    if positive.size == 0:
+        return None
+    vmin = float(np.percentile(positive, 1.0))
+    vmax = float(np.percentile(positive, 99.5))
+    if vmin <= 0:
+        vmin = float(np.min(positive))
+    if vmax <= vmin:
+        vmax = float(np.max(positive))
+    return colors.LogNorm(vmin=vmin, vmax=vmax)
+
+
 def _crop_box_from_planes(imgs: Dict[str, np.ndarray], margin: int) -> Optional[Tuple[slice, slice]]:
     ys: List[int] = []
     xs: List[int] = []
@@ -382,6 +406,7 @@ def plot_event_and_attribution(
 
         vmax0 = _auto_vmax(img)
         vmax1 = _auto_vmax(att)
+        attr_norm = _attr_log_norm(att)
 
         ax0 = axes[i, 0]
         ax1 = axes[i, 1]
@@ -393,7 +418,14 @@ def plot_event_and_attribution(
         fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
 
         ax1.imshow(img, origin="lower", cmap="gray", vmax=vmax0, interpolation="nearest")
-        im1 = ax1.imshow(att, origin="lower", alpha=0.6, vmax=vmax1, interpolation="nearest")
+        im1 = ax1.imshow(
+            att,
+            origin="lower",
+            alpha=0.6,
+            vmax=None if attr_norm is not None else vmax1,
+            interpolation="nearest",
+            norm=attr_norm,
+        )
         ax1.set_title(f"{name}: attribution overlay (grad×input)")
         ax1.set_xlabel("x")
         ax1.set_ylabel("y")
@@ -421,7 +453,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--num_samples", type=int, default=5000, help="How many random events to score before selecting.")
     ap.add_argument("--min_score", type=float, default=0.95, help="Score threshold for 'high-score' pool.")
     ap.add_argument("--topk_fallback", type=int, default=50, help="If no events exceed min_score, sample from top-K.")
-    ap.add_argument("--seed", type=int, default=int(getattr(cfg, "SEED", 123)))
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for event sampling. Defaults to None (random each run).",
+    )
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--out", default="event_attrib.png", help="Output image path. Use --no_out to display.")
@@ -459,7 +496,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         num_samples=int(args.num_samples),
         min_score=float(args.min_score),
         topk_fallback=int(args.topk_fallback),
-        seed=int(args.seed),
+        seed=args.seed,
         batch_size=int(args.batch_size),
         num_workers=int(args.num_workers),
         device=device,
