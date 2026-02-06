@@ -43,10 +43,10 @@ try:
     from .fusion import MultiViewSetClassifier
     from .model import make_backbone
 except Exception:
-    import config as cfg
-    from dataset import ShardDataset, collate_me_fusion
-    from fusion import MultiViewSetClassifier
-    from model import make_backbone
+    from likelihood import config as cfg
+    from likelihood.dataset import ShardDataset, collate_me_fusion
+    from likelihood.fusion import MultiViewSetClassifier
+    from likelihood.model import make_backbone
 
 
 class EvalDataset(ShardDataset):
