@@ -33,10 +33,12 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import array
 import csv
 import glob
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -44,10 +46,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-
-import matplotlib
-matplotlib.use("Agg")  # headless-safe
-import matplotlib.pyplot as plt
 
 import MinkowskiEngine as ME
 
@@ -320,6 +318,33 @@ def _llr_curve_from_scores(
     return x, r, metrics
 
 
+def _to_root_graph(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    color: int,
+    name: str,
+):
+    """
+    Make a ROOT.TGraph with consistent styling (line+markers),
+    similar to plot_loss_root.py.
+    """
+    import ROOT  # type: ignore
+
+    # ROOT wants Python array('d') or buffers of doubles.
+    xs = array.array("d", [float(v) for v in np.asarray(x, dtype=np.float64).reshape(-1)])
+    ys = array.array("d", [float(v) for v in np.asarray(y, dtype=np.float64).reshape(-1)])
+    gr = ROOT.TGraph(len(xs), xs, ys)
+    gr.SetName(name)
+
+    gr.SetLineColor(color)
+    gr.SetMarkerColor(color)
+    gr.SetLineWidth(1)
+    gr.SetMarkerStyle(20)
+    gr.SetMarkerSize(0.45)
+    return gr
+
+
 def _checkpoint_glob_from_base(ckpt_base: Path) -> str:
     # train.py creates: <stem>_stepXXXXXXX<suffix>
     stem = ckpt_base.stem
@@ -533,31 +558,118 @@ def main() -> None:
         for m in sorted(metrics_all, key=lambda t: t.step):
             wcsv.writerow(vars(m))
 
-    # Plot
+    # Plot (PyROOT)
     curves.sort(key=lambda t: t[0])
-    plt.figure()
-
-    allx = np.concatenate([x for (_, x, _) in curves if x.size > 0], axis=0) if curves else np.array([])
-    if allx.size > 0:
-        xmin = float(np.min(allx))
-        xmax = float(np.max(allx))
-        refx = np.linspace(xmin, xmax, 200)
-        plt.plot(refx, refx, linestyle="--", label="y=x")
-
-    for step, x, r in curves:
-        if x.size >= 2:
-            plt.plot(x, r, marker=".", linewidth=1.0, label=f"step {step}")
-
-    plt.xlabel("z (model logit)")
-    plt.ylabel("r(z) = log p_s(z) - log p_b(z)  (weighted hist in score space)")
-    plt.title("LLR self-consistency in score space")
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-
     plot_path = out_dir / str(args.plot_name)
-    plt.savefig(plot_path, dpi=180)
-    plt.close()
+
+    try:
+        import ROOT  # type: ignore
+    except ImportError:
+        sys.stderr.write(
+            "ERROR: PyROOT is not available (this script expects `import ROOT` to work).\n"
+        )
+        raise SystemExit(2)
+
+    ROOT.gROOT.SetBatch(True)
+
+    # Style knobs to resemble plot_loss_root.py
+    ROOT.gStyle.SetOptStat(0)
+    ROOT.gStyle.SetOptTitle(0)
+    ROOT.gStyle.SetPadTickX(1)
+    ROOT.gStyle.SetPadTickY(1)
+    ROOT.gStyle.SetLegendBorderSize(0)
+
+    good = [(step, x, r) for (step, x, r) in curves if x is not None and r is not None and x.size >= 2]
+    if not good:
+        raise RuntimeError("No curves have >=2 points; nothing to plot.")
+
+    allx = np.concatenate([x for (_, x, _) in good], axis=0)
+    allr = np.concatenate([r for (_, _, r) in good], axis=0)
+
+    xmin_raw = float(np.min(allx))
+    xmax_raw = float(np.max(allx))
+    ymin_raw = float(np.min(np.concatenate([allr, allx], axis=0)))  # include y=x reference
+    ymax_raw = float(np.max(np.concatenate([allr, allx], axis=0)))
+
+    # Linear margins (avoid zero range)
+    dx = max(xmax_raw - xmin_raw, 1e-6)
+    dy = max(ymax_raw - ymin_raw, 1e-6)
+    xmin = xmin_raw - 0.05 * dx
+    xmax = xmax_raw + 0.05 * dx
+    ymin = ymin_raw - 0.05 * dy
+    ymax = ymax_raw + 0.05 * dy
+
+    c = ROOT.TCanvas("c_llr", "c_llr", 900, 650)
+    c.SetLeftMargin(0.12)
+    c.SetRightMargin(0.12)
+    c.SetBottomMargin(0.12)
+    c.SetTopMargin(0.06)
+
+    # Color cycle for multiple checkpoints
+    colors = [
+        ROOT.kBlue + 1,
+        ROOT.kRed + 1,
+        ROOT.kGreen + 2,
+        ROOT.kMagenta + 1,
+        ROOT.kOrange + 7,
+        ROOT.kCyan + 1,
+        ROOT.kViolet + 1,
+        ROOT.kBlack,
+    ]
+
+    graphs: List[Tuple[int, "ROOT.TGraph"]] = []
+    for i, (step, x, r) in enumerate(good):
+        col = int(colors[i % len(colors)])
+        gr = _to_root_graph(x, r, color=col, name=f"gr_step{int(step)}")
+        graphs.append((int(step), gr))
+
+    if not graphs:
+        raise RuntimeError("No ROOT graphs created; nothing to plot.")
+
+    # Base graph drives axes/ranges
+    base = graphs[0][1]
+    base.SetMinimum(ymin)
+    base.SetMaximum(ymax)
+    base.Draw("ALP")
+    base.GetXaxis().SetLimits(xmin, xmax)
+    base.GetXaxis().SetTitle("z (model logit)")
+    base.GetYaxis().SetTitle("r(z) = log p_{s}(z) - log p_{b}(z)")
+    base.GetYaxis().SetTitleOffset(1.2)
+    base.GetXaxis().SetTitleOffset(1.0)
+
+    base.GetXaxis().SetTitleSize(0.05)
+    base.GetYaxis().SetTitleSize(0.05)
+    base.GetXaxis().SetLabelSize(0.04)
+    base.GetYaxis().SetLabelSize(0.04)
+
+    # Identity line y=x
+    line = ROOT.TLine(xmin, xmin, xmax, xmax)
+    line.SetLineStyle(2)
+    line.SetLineWidth(1)
+    line.Draw("same")
+
+    # Overlay remaining checkpoints
+    for _, gr in graphs[1:]:
+        gr.Draw("LP same")
+
+    # Legend (auto-sized to number of entries)
+    n_entries = 1 + len(graphs)  # identity + curves
+    top = 0.88
+    right = 0.88
+    left = 0.58
+    height = 0.05 * float(n_entries)
+    bottom = max(0.18, top - height)
+    leg = ROOT.TLegend(left, bottom, right, top)
+    leg.SetFillStyle(0)
+    leg.SetBorderSize(0)
+    leg.AddEntry(line, "y = x", "l")
+    for step, gr in graphs:
+        leg.AddEntry(gr, f"step {step}", "lp")
+    leg.Draw()
+
+    c.Modified()
+    c.Update()
+    c.SaveAs(str(plot_path))
 
     print(f"[done] wrote {plot_path} and {metrics_path}")
 
