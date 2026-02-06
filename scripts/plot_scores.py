@@ -129,6 +129,13 @@ def main():
     ap.add_argument("--drop-empty", action="store_true", help="Drop events with nnz==0 if index.pt provides nnz")
     ap.add_argument("--unweighted", action="store_true", help="Ignore nominal weights (use weight=1 for all events)")
     ap.add_argument(
+        "--max-per-class",
+        type=int,
+        default=10000,
+        help="Maximum number of events per class to evaluate (0 or less means no limit)",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="Random seed for class subsampling")
+    ap.add_argument(
         "--norm",
         choices=["density", "none"],
         default="density",
@@ -189,6 +196,25 @@ def main():
                 print(f"[data] including all events: {n_events} total")
         else:
             print(f"[data] including all events: {n_events} total")
+
+    if args.max_per_class > 0:
+        rng = np.random.default_rng(int(args.seed))
+        labels_filtered = labels_all[event_indices]
+        sig_idx = event_indices[labels_filtered > 0.5]
+        bkg_idx = event_indices[labels_filtered <= 0.5]
+
+        if sig_idx.size > args.max_per_class:
+            sig_idx = rng.choice(sig_idx, size=int(args.max_per_class), replace=False)
+        if bkg_idx.size > args.max_per_class:
+            bkg_idx = rng.choice(bkg_idx, size=int(args.max_per_class), replace=False)
+
+        event_indices = np.concatenate([sig_idx, bkg_idx]).astype(np.int64, copy=False)
+        rng.shuffle(event_indices)
+        print(
+            "[data] class subsample: "
+            f"signal={sig_idx.size}/{(labels_filtered > 0.5).sum()} "
+            f"background={bkg_idx.size}/{(labels_filtered <= 0.5).sum()}"
+        )
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
