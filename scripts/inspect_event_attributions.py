@@ -161,6 +161,7 @@ def pick_random_high_score_event(
     num_workers: int,
     device: torch.device,
     restrict_to_nnz_gt0: bool = True,
+    require_label: Optional[int] = None,
 ) -> Tuple[int, float, Dict]:
     """
     Sample `num_samples` events, score them, and pick a random event among those with score>=min_score.
@@ -187,6 +188,11 @@ def pick_random_high_score_event(
         nnz = nnz.reshape(-1)
         if nnz.shape[0] == n_events:
             pool = np.flatnonzero(nnz > 0).astype(np.int64, copy=False)
+
+    if require_label is not None:
+        label_mask = labels_all == int(require_label)
+        if label_mask.shape[0] == n_events:
+            pool = pool[label_mask[pool]]
 
     if pool.size == 0:
         raise ValueError("No eligible events in the pool to sample from (pool.size==0).")
@@ -594,7 +600,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no_nnz_filter", action="store_true", help="Do not restrict sampling to nnz>0 events.")
     ap.add_argument("--crop", action="store_true", help="Crop plots to ROI around hits (recommended).")
     ap.add_argument("--crop_margin", type=int, default=10, help="Margin (pixels) when --crop is enabled.")
-    ap.add_argument("--signal_only", action="store_true", help="Plot only the event display (no attributions).")
+    ap.add_argument(
+        "--signal_only",
+        action="store_true",
+        help="Sample only signal-labeled events and plot only the event display (no attributions).",
+    )
     args = ap.parse_args(argv)
 
     shards_dir = str(args.shards_dir)
@@ -628,6 +638,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         num_workers=int(args.num_workers),
         device=device,
         restrict_to_nnz_gt0=not bool(args.no_nnz_filter),
+        require_label=1 if bool(args.signal_only) else None,
     )
 
     print(
