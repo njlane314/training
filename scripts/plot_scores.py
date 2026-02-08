@@ -13,6 +13,9 @@ Default behavior:
   - Plots probability score = sigmoid(logit) on [0,1] with density normalization
   - Also writes a separate *logit* distribution plot when --score=prob with a
     dynamic x-range based on observed logits: <out_stem>_logit<out_suffix>
+  - If --score=logit and you do NOT pass --xmin/--xmax, the histogram range is
+    inferred from the observed min/max logits (with a small padding). This avoids
+    accidentally clipping logits at the old fixed [-10,10] default.
 
 Examples:
   python plot_scores.py
@@ -293,20 +296,34 @@ def main():
     if bins <= 0:
         raise ValueError("--bins must be > 0")
 
-    if args.xmin is None or args.xmax is None:
-        if args.score == "prob":
-            xmin = 0.0 if args.xmin is None else float(args.xmin)
-            xmax = 1.0 if args.xmax is None else float(args.xmax)
+    # NOTE: logits are unbounded (linear head). Any apparent clipping at ±10 can
+    # be an artifact of the histogram range. Numpy's histogram DROPS samples
+    # outside [xmin,xmax].
+    auto_range = (args.score == "logit") and (args.xmin is None or args.xmax is None)
+
+    if not auto_range:
+        if args.xmin is None or args.xmax is None:
+            if args.score == "prob":
+                xmin = 0.0 if args.xmin is None else float(args.xmin)
+                xmax = 1.0 if args.xmax is None else float(args.xmax)
+            else:
+                # Backward-compatible default (but can clip tails).
+                xmin = -10.0 if args.xmin is None else float(args.xmin)
+                xmax = 10.0 if args.xmax is None else float(args.xmax)
         else:
-            xmin = -10.0 if args.xmin is None else float(args.xmin)
-            xmax = 10.0 if args.xmax is None else float(args.xmax)
+            xmin, xmax = float(args.xmin), float(args.xmax)
+
+        edges, bin_w = _make_edges(xmin, xmax, bins)
+        hs = np.zeros(bins, dtype=np.float64)
+        hb = np.zeros(bins, dtype=np.float64)
     else:
-        xmin, xmax = float(args.xmin), float(args.xmax)
-
-    edges, bin_w = _make_edges(xmin, xmax, bins)
-
-    hs = np.zeros(bins, dtype=np.float64)
-    hb = np.zeros(bins, dtype=np.float64)
+        # We'll infer the missing bound(s) after we see the observed logit range.
+        xmin = None
+        xmax = None
+        edges = None
+        bin_w = None
+        hs = None
+        hb = None
 
     n_sig = 0
     n_bkg = 0
@@ -321,6 +338,7 @@ def main():
 
     # Optional per-event outputs
     save_arrays = bool(args.save_npz)
+    store_scores = save_arrays or auto_range
     scores_out = []
     y_out = []
     w_out = []
@@ -363,26 +381,75 @@ def main():
             bkg = ~sig
 
             if sig.any():
-                hs += np.histogram(score_np[sig], bins=edges, weights=w_np[sig])[0]
                 n_sig += int(sig.sum())
                 sumw_sig += float(w_np[sig].sum())
+                if not auto_range:
+                    hs += np.histogram(score_np[sig], bins=edges, weights=w_np[sig])[0]
 
             if bkg.any():
-                hb += np.histogram(score_np[bkg], bins=edges, weights=w_np[bkg])[0]
                 n_bkg += int(bkg.sum())
                 sumw_bkg += float(w_np[bkg].sum())
+                if not auto_range:
+                    hb += np.histogram(score_np[bkg], bins=edges, weights=w_np[bkg])[0]
 
             if logit_plot:
                 logit_out.append(logit_np)
                 y_logit_out.append(y_np)
                 w_logit_out.append(w_np)
 
-            if save_arrays:
+            if store_scores:
                 scores_out.append(score_np)
                 y_out.append(y_np)
                 w_out.append(w_np)
+            if save_arrays:
                 gi_out.append(gi_np)
 
+    # Report observed logit range (regardless of which score we plotted).
+    if np.isfinite(logit_min) and np.isfinite(logit_max):
+        print(f"[logit] observed range over evaluated events: [{logit_min:.6g}, {logit_max:.6g}]")
+
+    # If auto-ranging logits, build the histogram now using the observed min/max.
+    if auto_range:
+        if not np.isfinite(logit_min) or not np.isfinite(logit_max):
+            raise RuntimeError("Logit range is undefined; check input data.")
+
+        xmin = float(args.xmin) if args.xmin is not None else float(logit_min)
+        xmax = float(args.xmax) if args.xmax is not None else float(logit_max)
+
+        if not np.isfinite(xmin) or not np.isfinite(xmax):
+            raise RuntimeError(f"Non-finite auto-range xmin/xmax: xmin={xmin}, xmax={xmax}")
+
+        if xmax <= xmin:
+            delta = 1.0 if xmin == 0.0 else abs(xmin) * 0.1
+            xmin -= delta
+            xmax += delta
+        else:
+            # Small symmetric padding so extrema aren't glued to the frame.
+            pad = 0.02 * (xmax - xmin)
+            xmin -= pad
+            xmax += pad
+
+        edges, bin_w = _make_edges(xmin, xmax, bins)
+        hs = np.zeros(bins, dtype=np.float64)
+        hb = np.zeros(bins, dtype=np.float64)
+
+        # Chunked histogram accumulation to avoid a giant concatenate.
+        for score_np, y_np, w_np in zip(scores_out, y_out, w_out):
+            sig = y_np > 0.5
+            bkg = ~sig
+            if sig.any():
+                hs += np.histogram(score_np[sig], bins=edges, weights=w_np[sig])[0]
+            if bkg.any():
+                hb += np.histogram(score_np[bkg], bins=edges, weights=w_np[bkg])[0]
+
+    # If the user explicitly fixed logit limits, warn when clipping occurs.
+    if (args.score == "logit") and (not auto_range):
+        if (logit_min < float(xmin)) or (logit_max > float(xmax)):
+            print(
+                f"[warn] logits extend beyond histogram range [{float(xmin):.6g}, {float(xmax):.6g}]. "
+                "Samples outside the range are ignored by np.histogram. "
+                "Pass wider --xmin/--xmax (or omit either bound to auto-range)."
+            )
     if args.norm == "density":
         # Normalize each class to unit area: sum(hist * bin_width) == 1
         if hs.sum() > 0:
