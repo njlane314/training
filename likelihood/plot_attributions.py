@@ -20,6 +20,13 @@ For a single event:
 
 This file also enforces a 2-rows-by-3-columns layout (instead of 3x2).
 
+Important note (why you see "missing attribution" on many hits)
+---------------------------------------------------------------
+The backbone uses MinkowskiGlobalMaxPooling. The gradient of a max is zero
+for all non-argmax sites per channel, so gradient-based attributions are
+inherently sparse: most input hits will have exactly zero attribution.
+Use --explain-pool max_ste (recommended) or avg/lse to get dense maps.
+
 Usage
 -----
   python plot_attributions.py --ckpt checkpoints/ckpt_step0002000.pt --val-rank 0 --out-dir attrib
@@ -205,6 +212,93 @@ def _nonzero_percentiles(
     return lo, hi
 
 
+class _SparseGlobalLogSumExpPool(nn.Module):
+    """
+    Global log-sum-exp pooling over sparse sites, per batch and per channel.
+    Returns an ME.SparseTensor with one coordinate per batch at (b,0,0).
+    """
+
+    def __init__(self, beta: float):
+        super().__init__()
+        beta = float(beta)
+        if not np.isfinite(beta) or beta <= 0:
+            raise ValueError(f"beta must be > 0, got {beta}")
+        self.beta = beta
+
+    def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
+        F_in = x.F
+        if F_in.numel() == 0:
+            # Degenerate; return empty batch.
+            coords_out = torch.zeros((0, x.C.shape[1]), dtype=torch.int32)
+            return ME.SparseTensor(features=F_in, coordinates=coords_out, device=F_in.device)
+
+        # batch indices: (N,) on GPU for masking
+        b = x.C[:, 0].to(device=F_in.device, dtype=torch.int64, non_blocking=True)
+        B = int(b.max().item()) + 1
+        C = int(F_in.shape[1])
+
+        out = torch.zeros((B, C), device=F_in.device, dtype=F_in.dtype)
+        beta = float(self.beta)
+
+        for bi in range(B):
+            m = (b == bi)
+            if m.any():
+                Fb = F_in[m]  # [Ni, C]
+                out[bi] = torch.logsumexp(beta * Fb, dim=0) / beta
+
+        coords_out = torch.zeros((B, x.C.shape[1]), dtype=torch.int32)  # CPU coords
+        coords_out[:, 0] = torch.arange(B, dtype=torch.int32)
+        return ME.SparseTensor(features=out, coordinates=coords_out, device=out.device)
+
+
+class _SparseGlobalMaxPoolSTE(nn.Module):
+    """
+    Max pooling forward, but use log-sum-exp gradient (straight-through estimator).
+
+    Forward value matches true max pooling:
+        y = max(F)
+    Backward uses smooth LSE gradient:
+        dy/dF ~ softmax(beta * F)
+
+    This is ideal for attribution:
+      - logits match the checkpoint (same forward as max pooling)
+      - gradients are dense instead of argmax-sparse
+    """
+
+    def __init__(self, beta: float):
+        super().__init__()
+        beta = float(beta)
+        if not np.isfinite(beta) or beta <= 0:
+            raise ValueError(f"beta must be > 0, got {beta}")
+        self.beta = beta
+
+    def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
+        F_in = x.F
+        if F_in.numel() == 0:
+            coords_out = torch.zeros((0, x.C.shape[1]), dtype=torch.int32)
+            return ME.SparseTensor(features=F_in, coordinates=coords_out, device=F_in.device)
+
+        b = x.C[:, 0].to(device=F_in.device, dtype=torch.int64, non_blocking=True)
+        B = int(b.max().item()) + 1
+        C = int(F_in.shape[1])
+
+        out = torch.zeros((B, C), device=F_in.device, dtype=F_in.dtype)
+        beta = float(self.beta)
+
+        for bi in range(B):
+            m = (b == bi)
+            if m.any():
+                Fb = F_in[m]  # [Ni, C]
+                maxv = Fb.max(dim=0).values
+                lse = torch.logsumexp(beta * Fb, dim=0) / beta
+                # Forward == maxv, gradient == grad(lse)
+                out[bi] = lse + (maxv - lse).detach()
+
+        coords_out = torch.zeros((B, x.C.shape[1]), dtype=torch.int32)
+        coords_out[:, 0] = torch.arange(B, dtype=torch.int32)
+        return ME.SparseTensor(features=out, coordinates=coords_out, device=out.device)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, required=True, help="Checkpoint path (ckpt_step*.pt).")
@@ -246,6 +340,24 @@ def main() -> None:
             "'log' uses matplotlib LogNorm on nonzero pixels with percentile vmin/vmax (recommended). "
             "'linear' uses linear scaling with vmax from a high percentile."
         ),
+    )
+    ap.add_argument(
+        "--explain-pool",
+        type=str,
+        default="max_ste",
+        choices=("max", "max_ste", "avg", "lse"),
+        help=(
+            "Global pooling used inside the backbone during the attribution run. "
+            "max gives true gradients but is argmax-sparse (many hits get 0 attribution). "
+            "max_ste keeps the *forward* identical to max pooling but uses a smooth LSE gradient (recommended). "
+            "avg/lse use smooth pooling in both forward+backward."
+        ),
+    )
+    ap.add_argument(
+        "--pool-beta",
+        type=float,
+        default=5.0,
+        help="Beta for LSE pooling / max_ste surrogate gradient. Smaller => denser gradients; larger => closer to hard max.",
     )
     ap.add_argument(
         "--attr-qlo",
@@ -293,6 +405,21 @@ def main() -> None:
     state = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
     model.load_state_dict(state, strict=True)
     model.eval()
+
+    # Override backbone global pooling for attribution behavior.
+    # This does not affect checkpoint loading (pool has no parameters).
+    if hasattr(model, "backbone") and hasattr(model.backbone, "pool"):
+        if args.explain_pool == "avg":
+            model.backbone.pool = ME.MinkowskiGlobalAvgPooling()
+        elif args.explain_pool == "lse":
+            model.backbone.pool = _SparseGlobalLogSumExpPool(beta=float(args.pool_beta))
+        elif args.explain_pool == "max_ste":
+            model.backbone.pool = _SparseGlobalMaxPoolSTE(beta=float(args.pool_beta))
+        else:
+            # "max": leave as-is
+            pass
+    else:
+        raise RuntimeError("Expected model.backbone.pool to exist; cannot override pooling for attribution.")
 
     # Load the single event through the same collate path as training/inference.
     ds = ShardDataset(cfg.SHARDS_DIR, np.asarray([event_idx], dtype=np.int64), cache_size=2)
@@ -377,6 +504,10 @@ def main() -> None:
         else:
             grad = grad.detach()
 
+        # How sparse are gradients at the input sites?
+        g_site = grad.abs().sum(dim=1)
+        frac_nz = float((g_site > 0).to(dtype=torch.float32).mean().cpu())
+
         # Per-site scalars.
         inp_val = feats.sum(dim=1).detach().cpu().numpy()
         if args.attrib == "grad":
@@ -395,6 +526,7 @@ def main() -> None:
             amin_nz, p50, p90, p99 = 0.0, 0.0, 0.0, 0.0
         print(
             f"[attrib] plane={name}  n_sites={int(feats.shape[0])}  "
+            f"grad_nz_frac={frac_nz:.3f}  explain_pool={args.explain_pool}  "
             f"grad_abs_max={gmax:.3e}  attr_nz_min={amin_nz:.3e}  "
             f"attr_p50={p50:.3e} attr_p90={p90:.3e} attr_p99={p99:.3e} attr_max={amax:.3e}"
         )
@@ -446,7 +578,10 @@ def main() -> None:
         ax_at.set_xlabel("x")
         ax_at.set_ylabel("y")
 
-    fig.suptitle(f"event_idx={event_idx}  y={y0}  target={target_class}  logit={float(logit.detach().cpu()):+.3f}")
+    fig.suptitle(
+        f"event_idx={event_idx}  y={y0}  target={target_class}  "
+        f"logit={float(logit.detach().cpu()):+.3f}  explain_pool={args.explain_pool} beta={float(args.pool_beta):g}"
+    )
     fig.savefig(str(out_path), dpi=160)
     print(f"[done] wrote {out_path}")
 
