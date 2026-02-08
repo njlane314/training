@@ -123,8 +123,9 @@ def _step_to_inputs_with_grads(
     inputs: Dict[str, ME.SparseTensor] = {}
     feats_leaf: Dict[str, torch.Tensor] = {}
     for name in PLANES:
-        feats = feats_by_plane[name].to(device, non_blocking=True)
-        feats.requires_grad_(True)
+        # Make a true leaf tensor so .grad is always populated after backward().
+        # (Robust even if upstream ever starts producing non-leaf tensors here.)
+        feats = feats_by_plane[name].to(device, non_blocking=True).detach().requires_grad_(True)
         coords = coords_by_plane[name]  # keep CPU int32
         inputs[name] = ME.SparseTensor(features=feats, coordinates=coords, device=device)
         feats_leaf[name] = feats
@@ -132,33 +133,67 @@ def _step_to_inputs_with_grads(
 
 
 def _sparse_to_dense_2d(
-    coords_bxy: np.ndarray,
+    coords_byx: np.ndarray,
     values: np.ndarray,
+    *,
+    out_shape: Optional[Tuple[int, int]] = None,
+    batch_index: int = 0,
 ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
     """
-    coords_bxy: [N,3] (batch,x,y)
+    Rasterize sparse sites into a dense 2D image.
+
+    Coordinate convention (matches process.py + collate_me_fusion):
+      coords_byx: [N,3] int32 (batch, y, x)
     values:     [N]
 
     Returns:
       img:    [H,W] with y as rows, x as cols (imshow origin='lower' friendly)
       extent: (xmin, xmax, ymin, ymax) for matplotlib imshow
     """
-    if coords_bxy.size == 0:
+    if coords_byx.size == 0:
         img = np.zeros((1, 1), dtype=np.float32)
         return img, (0.0, 1.0, 0.0, 1.0)
 
-    x = coords_bxy[:, 1].astype(np.int64, copy=False)
-    y = coords_bxy[:, 2].astype(np.int64, copy=False)
+    c = np.asarray(coords_byx)
+    if c.ndim != 2 or c.shape[1] != 3:
+        raise ValueError(f"coords must have shape [N,3], got {c.shape}")
+
+    # Filter to the batch item we’re visualizing (defensive even though we enforce B=1).
+    b = c[:, 0].astype(np.int64, copy=False)
+    sel = (b == int(batch_index))
+    if not np.any(sel):
+        img = np.zeros((1, 1), dtype=np.float32)
+        return img, (0.0, 1.0, 0.0, 1.0)
+
+    # IMPORTANT: coords are (batch, y, x)
+    y = c[sel, 1].astype(np.int64, copy=False)
+    x = c[sel, 2].astype(np.int64, copy=False)
+    v = np.asarray(values, dtype=np.float32).reshape(-1)[sel]
+
+    if out_shape is not None:
+        H, W = int(out_shape[0]), int(out_shape[1])
+        if H <= 0 or W <= 0:
+            raise ValueError(f"out_shape must be positive, got {out_shape}")
+
+        img = np.zeros((H, W), dtype=np.float32)
+        inb = (x >= 0) & (x < W) & (y >= 0) & (y < H)
+        if np.any(inb):
+            # If duplicate coords exist, accumulate.
+            np.add.at(img, (y[inb], x[inb]), v[inb])
+
+        extent = (-0.5, float(W) - 0.5, -0.5, float(H) - 0.5)
+        return img, extent
+
+    # Tight crop around occupied pixels (legacy behavior).
     xmin, xmax = int(x.min()), int(x.max())
     ymin, ymax = int(y.min()), int(y.max())
     w = int(xmax - xmin + 1)
     h = int(ymax - ymin + 1)
     img = np.zeros((h, w), dtype=np.float32)
 
-    # If duplicate coords exist, accumulate (safe, and reasonable for display).
     xi = x - xmin
     yi = y - ymin
-    np.add.at(img, (yi, xi), values.astype(np.float32, copy=False))
+    np.add.at(img, (yi, xi), v)
 
     extent = (float(xmin) - 0.5, float(xmax) + 0.5, float(ymin) - 0.5, float(ymax) + 0.5)
     return img, extent
@@ -199,11 +234,15 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Load metadata once (also gives authoritative H/W used when shards were made).
+    meta = _load_meta(cfg.SHARDS_DIR)
+    H = int(meta.get("H", getattr(cfg, "H", 512)))
+    W = int(meta.get("W", getattr(cfg, "W", 512)))
+
     # Pick an event.
     if args.event_idx is not None:
         event_idx = int(args.event_idx)
     else:
-        meta = _load_meta(cfg.SHARDS_DIR)
         _, val_idx = _compute_splits_from_meta(meta, seed=int(cfg.SEED), val_fraction=float(cfg.VAL_FRACTION))
         val_idx = _sort_event_indices_for_io(meta, val_idx)
         vr = int(args.val_rank)
@@ -297,8 +336,9 @@ def main() -> None:
         inp_val = feats.sum(dim=1).detach().cpu().numpy()
         attr_val = (grad * feats).abs().sum(dim=1).detach().cpu().numpy()
 
-        img_in, extent_in = _sparse_to_dense_2d(coords, inp_val)
-        img_at, extent_at = _sparse_to_dense_2d(coords, attr_val)
+        # coords are (batch, y, x); rasterize into the full detector frame by default.
+        img_in, extent_in = _sparse_to_dense_2d(coords, inp_val, out_shape=(H, W), batch_index=0)
+        img_at, extent_at = _sparse_to_dense_2d(coords, attr_val, out_shape=(H, W), batch_index=0)
 
         ax_in.imshow(img_in, origin="lower", extent=extent_in, aspect="auto")
         ax_in.set_title(f"{name} input")
