@@ -9,11 +9,13 @@ What it does
 For a single event:
   - run a forward pass (with gradients enabled)
   - backprop a scalar objective (class-1: +logit, class-0: -logit)
-  - compute per-sparse-site attribution via |grad * input| reduced over channels
+  - compute per-sparse-site attribution via either:
+        * gxi : |grad * input| reduced over channels
+        * grad: |grad| reduced over channels
   - rasterize sparse coords -> dense 2D images for visualization
   - save a 2x3 grid:
         row 0: input intensity (sum over input channels)
-        row 1: attribution magnitude (|grad*input|, sum over channels)
+        row 1: attribution magnitude (method above)
     columns correspond to planes: u, v, w
 
 This file also enforces a 2-rows-by-3-columns layout (instead of 3x2).
@@ -123,8 +125,7 @@ def _step_to_inputs_with_grads(
     inputs: Dict[str, ME.SparseTensor] = {}
     feats_leaf: Dict[str, torch.Tensor] = {}
     for name in PLANES:
-        # Make a true leaf tensor so .grad is always populated after backward().
-        # (Robust even if upstream ever starts producing non-leaf tensors here.)
+        # Make a true leaf tensor so gradients are always accessible.
         feats = feats_by_plane[name].to(device, non_blocking=True).detach().requires_grad_(True)
         coords = coords_by_plane[name]  # keep CPU int32
         inputs[name] = ME.SparseTensor(features=feats, coordinates=coords, device=device)
@@ -140,10 +141,7 @@ def _sparse_to_dense_2d(
     batch_index: int = 0,
 ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
     """
-    Rasterize sparse sites into a dense 2D image.
-
-    Coordinate convention (matches process.py + collate_me_fusion):
-      coords_byx: [N,3] int32 (batch, y, x)
+    coords_byx: [N,3] (batch,y,x)  (matches process.py + collate_me_fusion)
     values:     [N]
 
     Returns:
@@ -158,45 +156,42 @@ def _sparse_to_dense_2d(
     if c.ndim != 2 or c.shape[1] != 3:
         raise ValueError(f"coords must have shape [N,3], got {c.shape}")
 
-    # Filter to the batch item we’re visualizing (defensive even though we enforce B=1).
     b = c[:, 0].astype(np.int64, copy=False)
     sel = (b == int(batch_index))
     if not np.any(sel):
         img = np.zeros((1, 1), dtype=np.float32)
         return img, (0.0, 1.0, 0.0, 1.0)
 
-    # IMPORTANT: coords are (batch, y, x)
+    # IMPORTANT: (batch, y, x)
     y = c[sel, 1].astype(np.int64, copy=False)
     x = c[sel, 2].astype(np.int64, copy=False)
     v = np.asarray(values, dtype=np.float32).reshape(-1)[sel]
 
     if out_shape is not None:
         H, W = int(out_shape[0]), int(out_shape[1])
-        if H <= 0 or W <= 0:
-            raise ValueError(f"out_shape must be positive, got {out_shape}")
-
         img = np.zeros((H, W), dtype=np.float32)
         inb = (x >= 0) & (x < W) & (y >= 0) & (y < H)
         if np.any(inb):
-            # If duplicate coords exist, accumulate.
             np.add.at(img, (y[inb], x[inb]), v[inb])
-
         extent = (-0.5, float(W) - 0.5, -0.5, float(H) - 0.5)
         return img, extent
 
-    # Tight crop around occupied pixels (legacy behavior).
     xmin, xmax = int(x.min()), int(x.max())
     ymin, ymax = int(y.min()), int(y.max())
     w = int(xmax - xmin + 1)
     h = int(ymax - ymin + 1)
     img = np.zeros((h, w), dtype=np.float32)
-
-    xi = x - xmin
-    yi = y - ymin
-    np.add.at(img, (yi, xi), v)
-
+    np.add.at(img, (y - ymin, x - xmin), v)
     extent = (float(xmin) - 0.5, float(xmax) + 0.5, float(ymin) - 0.5, float(ymax) + 0.5)
     return img, extent
+
+
+def _clip_vmax_from_nonzero(img: np.ndarray, q: float = 99.5) -> Optional[float]:
+    nz = np.asarray(img, dtype=np.float32)
+    nz = nz[nz > 0]
+    if nz.size == 0:
+        return None
+    return float(np.percentile(nz, float(q)))
 
 
 def main() -> None:
@@ -221,6 +216,14 @@ def main() -> None:
         choices=("pred", "true", "1", "0"),
         help="Which class to attribute: predicted, true label, or fixed {1,0}. "
         "For class-0 attributions we backprop -logit.",
+    )
+
+    ap.add_argument(
+        "--attrib",
+        type=str,
+        default="gxi",
+        choices=("gxi", "grad"),
+        help="Attribution method per sparse site: gxi=|grad*input|, grad=|grad| (both reduced over channels).",
     )
 
     ap.add_argument("--batch-size", type=int, default=1)
@@ -282,11 +285,6 @@ def main() -> None:
     m = available_mask.to(device, non_blocking=True)
 
     # Forward + choose scalar objective.
-    model.zero_grad(set_to_none=True)
-    for t in feats_leaf.values():
-        if t.grad is not None:
-            t.grad.zero_()
-
     # Disable AMP for attribution stability.
     with torch.cuda.amp.autocast(enabled=False):
         logits = model(inputs, available_mask=m).squeeze(1)  # [B]
@@ -305,7 +303,16 @@ def main() -> None:
 
         objective = logit if target_class == 1 else -logit
 
-    objective.backward()
+    # Compute grads explicitly (more reliable than relying on .grad side effects).
+    feat_list = [feats_leaf[name] for name in PLANES]
+    grad_list = torch.autograd.grad(
+        outputs=objective,
+        inputs=feat_list,
+        retain_graph=False,
+        create_graph=False,
+        allow_unused=True,
+    )
+    grads_by_plane: Dict[str, Optional[torch.Tensor]] = dict(zip(PLANES, grad_list))
 
     # Plot: 2 rows x 3 cols (u,v,w). Top=input, bottom=attribution.
     import matplotlib
@@ -328,25 +335,47 @@ def main() -> None:
 
         coords = coords_by_plane[name].detach().cpu().numpy()
         feats = feats_leaf[name].detach()
-        grad = feats_leaf[name].grad
+        grad = grads_by_plane.get(name, None)
         if grad is None:
-            raise RuntimeError(f"No gradient for plane {name}; check that features require_grad=True.")
+            # Disconnected (should be rare). Treat as zero attribution.
+            grad = torch.zeros_like(feats)
+        else:
+            grad = grad.detach()
 
         # Per-site scalars.
         inp_val = feats.sum(dim=1).detach().cpu().numpy()
-        attr_val = (grad * feats).abs().sum(dim=1).detach().cpu().numpy()
+        if args.attrib == "grad":
+            attr_val = grad.abs().sum(dim=1).detach().cpu().numpy()
+        else:
+            attr_val = (grad * feats).abs().sum(dim=1).detach().cpu().numpy()
+
+        # Debug: if this prints zeros, the model is locally insensitive to the inputs for this event.
+        gmax = float(grad.abs().max().cpu())
+        amax = float(np.max(attr_val)) if attr_val.size else 0.0
+        print(f"[attrib] plane={name}  n_sites={int(feats.shape[0])}  grad_abs_max={gmax:.3e}  attr_max={amax:.3e}")
 
         # coords are (batch, y, x); rasterize into the full detector frame by default.
         img_in, extent_in = _sparse_to_dense_2d(coords, inp_val, out_shape=(H, W), batch_index=0)
         img_at, extent_at = _sparse_to_dense_2d(coords, attr_val, out_shape=(H, W), batch_index=0)
 
-        ax_in.imshow(img_in, origin="lower", extent=extent_in, aspect="auto")
+        ax_in.imshow(img_in, origin="lower", extent=extent_in, aspect="auto", interpolation="nearest")
         ax_in.set_title(f"{name} input")
         ax_in.set_xlabel("x")
         ax_in.set_ylabel("y")
 
-        ax_at.imshow(img_at, origin="lower", extent=extent_at, aspect="auto")
-        ax_at.set_title(f"{name} attribution |grad*input|")
+        # Make sparse/heavy-tailed attributions visible.
+        disp_at = np.log1p(img_at.astype(np.float32, copy=False))
+        vmax = _clip_vmax_from_nonzero(disp_at, q=99.5)
+        ax_at.imshow(
+            disp_at,
+            origin="lower",
+            extent=extent_at,
+            aspect="auto",
+            interpolation="nearest",
+            vmin=0.0,
+            vmax=vmax,
+        )
+        ax_at.set_title(f"{name} attribution ({args.attrib})  log1p + clip")
         ax_at.set_xlabel("x")
         ax_at.set_ylabel("y")
 
