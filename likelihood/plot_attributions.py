@@ -186,12 +186,23 @@ def _sparse_to_dense_2d(
     return img, extent
 
 
-def _clip_vmax_from_nonzero(img: np.ndarray, q: float = 99.5) -> Optional[float]:
-    nz = np.asarray(img, dtype=np.float32)
+def _nonzero_percentiles(
+    img: np.ndarray,
+    *,
+    q_lo: float,
+    q_hi: float,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Percentiles over strictly-positive pixels (zeros are "no data" for LogNorm).
+    Returns (vlo, vhi) or (None, None) if no positive pixels exist.
+    """
+    nz = np.asarray(img, dtype=np.float32).reshape(-1)
     nz = nz[nz > 0]
     if nz.size == 0:
-        return None
-    return float(np.percentile(nz, float(q)))
+        return None, None
+    lo = float(np.percentile(nz, float(q_lo)))
+    hi = float(np.percentile(nz, float(q_hi)))
+    return lo, hi
 
 
 def main() -> None:
@@ -224,6 +235,29 @@ def main() -> None:
         default="gxi",
         choices=("gxi", "grad"),
         help="Attribution method per sparse site: gxi=|grad*input|, grad=|grad| (both reduced over channels).",
+    )
+    ap.add_argument(
+        "--attr-norm",
+        type=str,
+        default="log",
+        choices=("log", "linear"),
+        help=(
+            "How to map attribution magnitudes to colors. "
+            "'log' uses matplotlib LogNorm on nonzero pixels with percentile vmin/vmax (recommended). "
+            "'linear' uses linear scaling with vmax from a high percentile."
+        ),
+    )
+    ap.add_argument(
+        "--attr-qlo",
+        type=float,
+        default=5.0,
+        help="Lower percentile for attribution color scaling (computed on nonzero pixels). Used for LogNorm vmin.",
+    )
+    ap.add_argument(
+        "--attr-qhi",
+        type=float,
+        default=99.5,
+        help="Upper percentile for attribution color scaling (computed on nonzero pixels). Used for vmax.",
     )
 
     ap.add_argument("--batch-size", type=int, default=1)
@@ -319,6 +353,7 @@ def main() -> None:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
 
     fig, axs = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
 
@@ -352,7 +387,17 @@ def main() -> None:
         # Debug: if this prints zeros, the model is locally insensitive to the inputs for this event.
         gmax = float(grad.abs().max().cpu())
         amax = float(np.max(attr_val)) if attr_val.size else 0.0
-        print(f"[attrib] plane={name}  n_sites={int(feats.shape[0])}  grad_abs_max={gmax:.3e}  attr_max={amax:.3e}")
+        nz = attr_val[attr_val > 0]
+        if nz.size:
+            p50, p90, p99 = np.percentile(nz, [50.0, 90.0, 99.0])
+            amin_nz = float(nz.min())
+        else:
+            amin_nz, p50, p90, p99 = 0.0, 0.0, 0.0, 0.0
+        print(
+            f"[attrib] plane={name}  n_sites={int(feats.shape[0])}  "
+            f"grad_abs_max={gmax:.3e}  attr_nz_min={amin_nz:.3e}  "
+            f"attr_p50={p50:.3e} attr_p90={p90:.3e} attr_p99={p99:.3e} attr_max={amax:.3e}"
+        )
 
         # coords are (batch, y, x); rasterize into the full detector frame by default.
         img_in, extent_in = _sparse_to_dense_2d(coords, inp_val, out_shape=(H, W), batch_index=0)
@@ -363,19 +408,41 @@ def main() -> None:
         ax_in.set_xlabel("x")
         ax_in.set_ylabel("y")
 
-        # Make sparse/heavy-tailed attributions visible.
-        disp_at = np.log1p(img_at.astype(np.float32, copy=False))
-        vmax = _clip_vmax_from_nonzero(disp_at, q=99.5)
-        ax_at.imshow(
-            disp_at,
-            origin="lower",
-            extent=extent_at,
-            aspect="auto",
-            interpolation="nearest",
-            vmin=0.0,
-            vmax=vmax,
-        )
-        ax_at.set_title(f"{name} attribution ({args.attrib})  log1p + clip")
+        # Attribution visualization:
+        # - For values in [1e-5, 1e-1], log1p is ~identity and hides structure.
+        # - Use LogNorm over nonzero pixels, matching your earlier decade-scaled plots.
+        img_at_f = img_at.astype(np.float32, copy=False)
+        if args.attr_norm == "log":
+            vlo, vhi = _nonzero_percentiles(img_at_f, q_lo=float(args.attr_qlo), q_hi=float(args.attr_qhi))
+            if vlo is None or vhi is None:
+                ax_at.imshow(img_at_f, origin="lower", extent=extent_at, aspect="auto", interpolation="nearest")
+            else:
+                # Guard against vmin<=0 and vhi<=vlo.
+                vmin = max(float(vlo), 1e-12)
+                vmax = max(float(vhi), vmin * 1.001)
+                show = np.ma.masked_less_equal(img_at_f, 0.0)
+                ax_at.imshow(
+                    show,
+                    origin="lower",
+                    extent=extent_at,
+                    aspect="auto",
+                    interpolation="nearest",
+                    norm=LogNorm(vmin=vmin, vmax=vmax),
+                )
+        else:
+            # Linear scaling but ignore zeros when picking vmax.
+            _, vhi = _nonzero_percentiles(img_at_f, q_lo=50.0, q_hi=float(args.attr_qhi))
+            ax_at.imshow(
+                img_at_f,
+                origin="lower",
+                extent=extent_at,
+                aspect="auto",
+                interpolation="nearest",
+                vmin=0.0,
+                vmax=vhi,
+            )
+
+        ax_at.set_title(f"{name} attribution ({args.attrib})  norm={args.attr_norm}")
         ax_at.set_xlabel("x")
         ax_at.set_ylabel("y")
 
