@@ -31,6 +31,10 @@ Usage
 -----
   python plot_attributions.py --ckpt checkpoints/ckpt_step0002000.pt --val-rank 0 --out-dir attrib
   python plot_attributions.py --ckpt checkpoints/ckpt_step0002000.pt --event-idx 12345 --target pred
+  # random signal event (y=1) from the deterministic val split
+  python plot_attributions.py --ckpt checkpoints/ckpt_step0002000.pt --random-signal --target true
+  # random signal from anywhere (all good nnz>0 events if index.pt has nnz)
+  python plot_attributions.py --ckpt checkpoints/ckpt_step0002000.pt --random-signal --random-from all --target true
 """
 
 from __future__ import annotations
@@ -313,6 +317,35 @@ def main() -> None:
         default=0,
         help="If --event-idx not set: pick this rank from the deterministic val split.",
     )
+    g.add_argument(
+        "--random",
+        action="store_true",
+        help="If --event-idx not set: pick a random event from --random-from (default: val).",
+    )
+    g.add_argument(
+        "--random-signal",
+        action="store_true",
+        help="If --event-idx not set: pick a random signal event (y=1) from --random-from (default: val).",
+    )
+    g.add_argument(
+        "--random-background",
+        action="store_true",
+        help="If --event-idx not set: pick a random background event (y=0) from --random-from (default: val).",
+    )
+
+    ap.add_argument(
+        "--random-from",
+        type=str,
+        default="val",
+        choices=("val", "train", "all"),
+        help="Pool to draw random events from (used with --random*).",
+    )
+    ap.add_argument(
+        "--rng-seed",
+        type=int,
+        default=None,
+        help="Seed for random event selection (omit for nondeterministic selection).",
+    )
 
     ap.add_argument(
         "--target",
@@ -392,12 +425,67 @@ def main() -> None:
     if args.event_idx is not None:
         event_idx = int(args.event_idx)
     else:
-        _, val_idx = _compute_splits_from_meta(meta, seed=int(cfg.SEED), val_fraction=float(cfg.VAL_FRACTION))
-        val_idx = _sort_event_indices_for_io(meta, val_idx)
-        vr = int(args.val_rank)
-        if vr < 0 or vr >= int(val_idx.size):
-            raise ValueError(f"--val-rank out of range: {vr} (val size={val_idx.size})")
-        event_idx = int(val_idx[vr])
+        # Build deterministic splits (matches training).
+        train_idx, val_idx = _compute_splits_from_meta(meta, seed=int(cfg.SEED), val_fraction=float(cfg.VAL_FRACTION))
+
+        # Build "all good events" pool (respect nnz>0 filtering if present).
+        n_events = int(meta["n_events"])
+        labels_all = np.asarray(meta["labels"], dtype=np.uint8).reshape(-1)
+        if labels_all.shape[0] != n_events:
+            raise ValueError(f"index.pt labels len={labels_all.shape[0]} != n_events={n_events}")
+
+        good_idx: np.ndarray
+        if "nnz" in meta and meta["nnz"] is not None:
+            if isinstance(meta["nnz"], torch.Tensor):
+                nnz_all = meta["nnz"].to(dtype=torch.int64).cpu().numpy().reshape(-1)
+            else:
+                nnz_all = np.asarray(meta["nnz"], dtype=np.int64).reshape(-1)
+            if nnz_all.shape[0] != n_events:
+                raise ValueError(f"index.pt nnz len={nnz_all.shape[0]} != n_events={n_events}")
+            good_idx = np.flatnonzero(nnz_all > 0).astype(np.int64, copy=False)
+        else:
+            good_idx = np.arange(n_events, dtype=np.int64)
+
+        do_random = bool(args.random or args.random_signal or args.random_background)
+        if do_random:
+            if args.random_from == "val":
+                pool = val_idx
+            elif args.random_from == "train":
+                pool = train_idx
+            else:
+                pool = good_idx
+
+            want_label: Optional[int] = None
+            if args.random_signal:
+                want_label = 1
+            elif args.random_background:
+                want_label = 0
+
+            if want_label is not None:
+                pool = pool[labels_all[pool] == np.uint8(want_label)]
+
+            if pool.size == 0:
+                raise ValueError(
+                    f"No events available for random selection: random_from={args.random_from} "
+                    f"label={want_label if want_label is not None else 'any'}"
+                )
+
+            rng = np.random.default_rng(None if args.rng_seed is None else int(args.rng_seed))
+            event_idx = int(rng.choice(pool))
+            y_meta = int(labels_all[event_idx])
+            sel = "random"
+            if args.random_signal:
+                sel = "random-signal"
+            elif args.random_background:
+                sel = "random-background"
+            print(f"[pick] {sel} from {args.random_from}: event_idx={event_idx} (y={y_meta}) seed={args.rng_seed}")
+        else:
+            # Deterministic val-rank selection (IO-sorted for convenience).
+            val_idx = _sort_event_indices_for_io(meta, val_idx)
+            vr = int(args.val_rank)
+            if vr < 0 or vr >= int(val_idx.size):
+                raise ValueError(f"--val-rank out of range: {vr} (val size={val_idx.size})")
+            event_idx = int(val_idx[vr])
 
     # Load model + checkpoint.
     model = _build_model_from_cfg(device)
