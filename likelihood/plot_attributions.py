@@ -12,6 +12,7 @@ For a single event:
   - compute per-sparse-site attribution via either:
         * gxi : |grad * input| reduced over channels
         * grad: |grad| reduced over channels
+    and optionally restrict to a specific input feature channel via --attr-channel
   - rasterize sparse coords -> dense 2D images for visualization
   - save a 2x3 grid:
         row 0: input intensity (sum over input channels)
@@ -364,6 +365,19 @@ def main() -> None:
         help="Attribution method per sparse site: gxi=|grad*input|, grad=|grad| (both reduced over channels).",
     )
     ap.add_argument(
+        "--attr-channel",
+        type=str,
+        default="both",
+        choices=("both", "occ", "logq"),
+        help=(
+            "Which input feature channel(s) contribute to the attribution reduction over channels. "
+            "Input features are (occ, logq). "
+            "'both' sums over both channels (default). "
+            "'occ' uses only channel 0 (occupancy). "
+            "'logq' uses only channel 1 (log1p(charge)) for 'charge-only' importance."
+        ),
+    )
+    ap.add_argument(
         "--attr-norm",
         type=str,
         default="log",
@@ -592,19 +606,41 @@ def main() -> None:
         else:
             grad = grad.detach()
 
-        # How sparse are gradients at the input sites?
-        g_site = grad.abs().sum(dim=1)
+        # Select which feature channel(s) we attribute.
+        # Features are (occ, logq). Restricting the channel changes both:
+        #   - the attribution scalar (gxi or grad)
+        #   - the "grad_nz_frac" diagnostic (computed on the selected channels)
+        if feats.ndim != 2 or grad.ndim != 2 or feats.shape != grad.shape:
+            raise RuntimeError(
+                f"Expected feats and grad to be [N,C] with the same shape, got feats={tuple(feats.shape)} grad={tuple(grad.shape)}"
+            )
+        if feats.shape[1] < 2:
+            raise RuntimeError(
+                f"--attr-channel expects >=2 input feature channels (occ, logq), got C={int(feats.shape[1])}"
+            )
+        if args.attr_channel == "both":
+            feats_use = feats
+            grad_use = grad
+        elif args.attr_channel == "occ":
+            feats_use = feats[:, 0:1]
+            grad_use = grad[:, 0:1]
+        else:  # "logq"
+            feats_use = feats[:, 1:2]
+            grad_use = grad[:, 1:2]
+
+        # How sparse are gradients at the input sites (on selected channel(s))?
+        g_site = grad_use.abs().sum(dim=1)
         frac_nz = float((g_site > 0).to(dtype=torch.float32).mean().cpu())
 
         # Per-site scalars.
         inp_val = feats.sum(dim=1).detach().cpu().numpy()
         if args.attrib == "grad":
-            attr_val = grad.abs().sum(dim=1).detach().cpu().numpy()
+            attr_val = grad_use.abs().sum(dim=1).detach().cpu().numpy()
         else:
-            attr_val = (grad * feats).abs().sum(dim=1).detach().cpu().numpy()
+            attr_val = (grad_use * feats_use).abs().sum(dim=1).detach().cpu().numpy()
 
         # Debug: if this prints zeros, the model is locally insensitive to the inputs for this event.
-        gmax = float(grad.abs().max().cpu())
+        gmax = float(grad_use.abs().max().cpu())
         amax = float(np.max(attr_val)) if attr_val.size else 0.0
         nz = attr_val[attr_val > 0]
         if nz.size:
@@ -614,7 +650,7 @@ def main() -> None:
             amin_nz, p50, p90, p99 = 0.0, 0.0, 0.0, 0.0
         print(
             f"[attrib] plane={name}  n_sites={int(feats.shape[0])}  "
-            f"grad_nz_frac={frac_nz:.3f}  explain_pool={args.explain_pool}  "
+            f"grad_nz_frac={frac_nz:.3f}  explain_pool={args.explain_pool}  attr_channel={args.attr_channel}  "
             f"grad_abs_max={gmax:.3e}  attr_nz_min={amin_nz:.3e}  "
             f"attr_p50={p50:.3e} attr_p90={p90:.3e} attr_p99={p99:.3e} attr_max={amax:.3e}"
         )
@@ -662,7 +698,7 @@ def main() -> None:
                 vmax=vhi,
             )
 
-        ax_at.set_title(f"{name} attribution ({args.attrib})  norm={args.attr_norm}")
+        ax_at.set_title(f"{name} attribution ({args.attrib}/{args.attr_channel})  norm={args.attr_norm}")
         ax_at.set_xlabel("x")
         ax_at.set_ylabel("y")
 
